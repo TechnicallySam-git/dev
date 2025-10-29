@@ -1,0 +1,105 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>FRUTA Telemetry Viewer</title>
+  <style>
+    body{font-family:Segoe UI,Arial;margin:16px}
+    .item{border:1px solid #ccc;padding:8px;margin:8px 0}
+    img{max-width:400px;height:auto;display:block}
+  </style>
+</head>
+<body>
+  <h1>Latest FRUTA Telemetry</h1>
+  <div>
+    <label>Storage account:</label>
+    <input id="account" value="frutablob" />
+    <label>Container:</label>
+    <input id="container" value="frutacontainer2" />
+    <br/>
+    <label>SAS token (paste, starts with ?sv=...):</label>
+    <input id="sas" style="width:80%" />
+    <button id="go">Load latest</button>
+  </div>
+  <div id="out"></div>
+
+<script>
+async function listBlobs(account, container, sas){
+  const url = `https://frutablob.blob.core.windows.net/fruta-container2?sp=racwli&st=2025-10-29T10:43:45Z&se=2026-10-29T18:58:45Z&sv=2024-11-04&sr=c&sig=SH3EEmyBtdsgMnizKaWvyD8IOrJ6uKSxDTvFQAoyS0A%3D`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('List failed: '+res.status);
+  const text = await res.text();
+  // simple XML parse to get <Name> elements
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(text, "application/xml");
+  const names = Array.from(doc.querySelectorAll("Name")).map(n=>n.textContent);
+  const dates = Array.from(doc.querySelectorAll("Last-Modified")).map(n=>n.textContent);
+  // build objects, pick latest by name or Last-Modified
+  const items = names.map((name,i)=>({name, lastModified: dates[i]}));
+  // sort by Last-Modified descending
+  items.sort((a,b)=> new Date(b.lastModified) - new Date(a.lastModified));
+  return items;
+}
+
+async function fetchBlobText(account, container, name, sas){
+  const url = `https://${account}.blob.core.windows.net/${container}/${encodeURIComponent(name)}${sas}`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error('Fetch blob failed: '+res.status);
+  return await res.text();
+}
+
+function decodeEnvelopeLine(line){
+  try {
+    const env = JSON.parse(line);
+    if(env.Body){
+      const decoded = atob(env.Body);
+      try { return JSON.parse(decoded); }
+      catch(e){ return { raw: decoded }; }
+    }
+    return env;
+  } catch(e){
+    return null;
+  }
+}
+
+document.getElementById('go').addEventListener('click', async ()=>{
+  const account = document.getElementById('account').value.trim();
+  const container = document.getElementById('container').value.trim();
+  const sas = document.getElementById('sas').value.trim();
+  const out = document.getElementById('out');
+  out.innerHTML = 'Listing...';
+  try {
+    const items = await listBlobs(account, container, sas);
+    if(items.length === 0){ out.innerText = 'No blobs found'; return; }
+    const latest = items[0];
+    out.innerHTML = `<h3>Latest blob: ${latest.name} (modified ${latest.lastModified})</h3><div id="items"></div>`;
+    const text = await fetchBlobText(account, container, latest.name, sas);
+    const lines = text.split(/\r?\n/).filter(l=>l.trim());
+    const containerEl = document.getElementById('items');
+    for(const line of lines){
+      const payload = decodeEnvelopeLine(line);
+      if(!payload) continue;
+      const div = document.createElement('div'); div.className = 'item';
+      div.innerHTML = `<pre>${JSON.stringify(payload, null, 2)}</pre>`;
+      // if payload contains a blobUrl or imageFileName build image link
+      if(payload.blobUrl){
+        const a = document.createElement('a'); a.href = payload.blobUrl; a.target='_blank'; a.textContent='Open image';
+        div.appendChild(a);
+        const img = document.createElement('img'); img.src = payload.blobUrl; div.appendChild(img);
+      } else if (payload.imageFileName){
+        // try to construct public blob URL (requires blob accessible)
+        const imgUrl = `https://${account}.blob.core.windows.net/${payload.imageFileName}${sas}`;
+        // if imageFileName includes a container path, adjust accordingly
+        const a = document.createElement('a'); a.href = imgUrl; a.target='_blank'; a.textContent='Open image';
+        div.appendChild(a);
+        const img = document.createElement('img'); img.src = imgUrl; div.appendChild(img);
+      }
+      containerEl.appendChild(div);
+    }
+  } catch(err){
+    out.innerText = 'Error: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
