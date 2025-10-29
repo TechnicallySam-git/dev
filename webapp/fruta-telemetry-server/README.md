@@ -1,65 +1,70 @@
-# FRUTA Telemetry Server
+# FRUTA Telemetry Viewer
 
 ## Overview
-The FRUTA Telemetry Server is a Node.js application that retrieves images and telemetry data from Azure Blob Storage and serves it to clients for viewing on a web interface. This project is designed to facilitate the monitoring and analysis of telemetry data related to fruit harvesting.
+The FRUTA Telemetry Viewer is a Flask-based web application designed to display images and telemetry data from Azure Blob Storage. Users can view the latest images captured by the telemetry system and click on them to see corresponding telemetry messages.
 
 ## Project Structure
 ```
 fruta-telemetry-server
-├── src
-│   ├── server.ts               # Entry point of the server application
-│   ├── app.ts                  # Configures the Express application
-│   ├── routes
-│   │   └── api.ts              # Defines API routes for the application
-│   ├── controllers
-│   │   └── blobController.ts    # Handles requests related to blob storage
-│   ├── services
-│   │   └── blobService.ts       # Interacts with Azure Blob Storage
-│   ├── middleware
-│   │   └── errorHandler.ts      # Middleware for error handling
-│   ├── config
-│   │   └── index.ts             # Configuration settings for the application
-│   ├── types
-│   │   └── index.ts             # TypeScript interfaces and types
-│   └── public
-│       └── index.html           # Front-end HTML file
-├── package.json                 # npm configuration file
-├── tsconfig.json                # TypeScript configuration file
-├── .env.example                 # Example of environment variables
-├── .gitignore                   # Files and directories to ignore by Git
-└── README.md                    # Documentation for the project
+├── app.py                  # Entry point of the Flask application
+├── requirements.txt        # Project dependencies
+├── .env.example            # Example environment variables
+├── README.md               # Project documentation
+├── templates               # HTML templates
+│   └── index.html         # Main template for the telemetry viewer
+├── static                  # Static files (CSS, JS)
+│   ├── js
+│   │   └── main.js        # JavaScript for user interactions
+│   └── css
+│       └── styles.css     # Styles for the application
+├── services                # Service layer for Azure Blob Storage interactions
+│   └── blob.py            # Functions for listing and fetching blobs
+├── api                     # API routes
+│   └── routes.py          # Defines API endpoints
+└── tests                   # Unit tests
+    └── test_app.py        # Tests for the application
 ```
 
-## Installation
-1. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/fruta-telemetry-server.git
-   ```
-2. Navigate to the project directory:
-   ```
+## Setup Instructions
+
+1. **Clone the Repository**
+   ```bash
+   git clone <repository-url>
    cd fruta-telemetry-server
    ```
-3. Install the dependencies:
-   ```
-   npm install
+
+2. **Create a Virtual Environment**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
    ```
 
-## Configuration
-- Create a `.env` file in the root directory and populate it with the necessary environment variables. You can use the `.env.example` file as a reference.
+3. **Install Dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## Running the Application
-To start the server, run the following command:
-```
-npm start
-```
-The server will be available at `http://localhost:3000`.
+4. **Configure Environment Variables**
+   - Copy `.env.example` to `.env` and fill in the required values:
+     ```
+     AZURE_STORAGE_ACCOUNT=<your_account_name>
+     AZURE_STORAGE_SAS_TOKEN=<your_sas_token>
+     ```
+
+5. **Run the Application**
+   ```bash
+   python app.py
+   ```
+
+6. **Access the Application**
+   Open your web browser and navigate to `http://localhost:5000` to view the telemetry data.
 
 ## Usage
-- Access the front-end application by navigating to `http://localhost:3000` in your web browser.
-- The application allows users to view the latest images and telemetry data retrieved from Azure Blob Storage.
+- The main page displays the latest images from Azure Blob Storage.
+- Click on an image to view its associated telemetry messages.
 
 ## Contributing
-Contributions are welcome! Please open an issue or submit a pull request for any enhancements or bug fixes.
+Contributions are welcome! Please submit a pull request or open an issue for any enhancements or bug fixes.
 
 ## License
-This project is licensed under the MIT License. See the LICENSE file for more details.
+This project is licensed under the MIT License. See the LICENSE file for details.
