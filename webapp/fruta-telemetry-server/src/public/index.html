@@ -1,0 +1,506 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>FRUTA Telemetry Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <style>
+    :root{
+      --bg:#f3f6fb; --card:#fff; --muted:#6b7280; --accent:#0ea5a4; --accent-600:#089189;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:#0f172a}
+    .wrap{max-width:1100px;margin:24px auto;padding:18px}
+    header{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}
+    header h1{margin:0;font-size:20px}
+    header p{margin:0;color:var(--muted);font-size:13px}
+    .controls-row{display:flex;gap:10px;align-items:center}
+    .card{background:var(--card);border-radius:10px;box-shadow:0 8px 24px rgba(15,23,42,0.06);padding:14px}
+    .top-grid{display:grid;grid-template-columns: 1fr 380px; gap:14px}
+    .viewer{min-height:360px;border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+    .viewer .imgwrap{flex:1;background:linear-gradient(180deg,#eef6f9,#fff);display:flex;align-items:center;justify-content:center;border-radius:8px;padding:12px}
+    .viewer img{max-width:100%;max-height:100%;object-fit:contain;border-radius:8px;box-shadow:0 6px 16px rgba(15,23,42,0.06)}
+    .side-list{height:360px;overflow:auto;padding:10px;border-radius:8px;border:1px solid #eef4f6;background:#fbfcfd}
+    .list-item{padding:10px;border-radius:8px;border-bottom:1px dashed #eef2f3;cursor:pointer}
+    .list-item:last-child{border-bottom:0}
+    .list-item:hover{background:#f0fbfa}
+    .time{font-size:12px;color:var(--muted)}
+    .badge{padding:4px 8px;background:var(--accent);color:#fff;border-radius:999px;font-weight:700;font-size:12px;margin-left:8px}
+    .chart-area{margin-top:16px;padding:14px;border-radius:10px}
+    .controls{display:flex;gap:10px;flex-wrap:wrap}
+    input,select{padding:8px 10px;border-radius:8px;border:1px solid #e6e9ef}
+    button{background:var(--accent);color:#fff;border:none;padding:8px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+    .muted{color:var(--muted);font-size:13px}
+    @media(max-width:980px){
+      .top-grid{grid-template-columns:1fr}
+      .side-list{height:auto}
+      .viewer{min-height:260px}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>FRUTA Telemetry Viewer</h1>
+        <p class="muted">Latest photo, detections and telemetry — click a row to load that image.</p>
+      </div>
+      <div class="controls-row">
+        <button id="go">Load latest</button>
+        <button id="autoRefreshToggle" title="Toggle auto refresh" style="background:transparent;color:var(--accent);border:1px solid #e6e9ef;padding:6px;border-radius:8px;cursor:pointer">Auto refresh: Off</button>
+        <button id="settingsBtn" title="Settings" style="background:transparent;color:var(--accent);border:1px solid #e6e9ef;padding:6px;border-radius:8px;">⚙️</button>
+        <!-- Hidden inputs: values are edited through settings panel and persisted to localStorage -->
+        <input id="containerUrl" type="url" placeholder="https://account.blob.core.windows.net/container?sv=..." style="display:none;width:420px"/>
+        <input id="sas" type="text" placeholder="?sv=... (optional if included in URL)" style="display:none;width:360px"/>
+      </div>
+    </header>
+
+    <div class="card">
+      <div class="top-grid">
+        <div class="viewer">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div class="muted">Most recent photo / video</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <div id="detectionBadge" class="badge" style="display:none">MANGO</div>
+              <div id="photoInfo" class="muted"></div>
+            </div>
+          </div>
+          <div class="imgwrap" id="imgwrap">
+            <div class="muted">No image loaded</div>
+          </div>
+        </div>
+
+        <div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div class="muted">Timestamps & messages</div>
+            <div><button id="analyzeSelected" disabled>Analyze (vision)</button></div>
+          </div>
+          <div class="side-list" id="list"></div>
+        </div>
+      </div>
+
+      <div class="chart-area">
+        <canvas id="trendChart" height="140"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings overlay (hidden by default) -->
+  <div id="settingsOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.35);align-items:center;justify-content:center;">
+    <div class="card" style="width:720px;margin:auto;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div><strong>Settings</strong><div class="muted">Paste your container URL or SAS token here — values are saved locally.</div></div>
+        <div><button id="closeSettings">Close</button></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-direction:column;">
+        <label class="muted">Container URL (optional, include SAS if you want)</label>
+        <input id="settingsContainerUrl" type="url" style="width:100%" />
+        <label class="muted">SAS token (optional, if not in URL)</label>
+        <input id="settingsSas" type="text" style="width:100%" />
+        <label class="muted">Container/account defaults (optional)</label>
+        <div style="display:flex;gap:8px;">
+          <input id="settingsAccount" placeholder="account name (e.g. frutablob)" style="flex:1"/>
+          <input id="settingsContainer" placeholder="container name (e.g. fruta-container2)" style="flex:1"/>
+        </div>
+        <div style="display:flex;justify-content:flex-end;margin-top:8px">
+          <button id="saveSettings">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script>
+    // defaults (can be overridden via Settings and saved in localStorage)
+    const accountEl = { account: 'frutablob', container: 'fruta-container2' };
+    // Auto-refresh / polling configuration with exponential backoff
+    let autoRefresh = false;
+    let pollHandle = null;
+    let currentPollMs = 5000;          // start at 5s for faster updates
+    const basePollMs = 5000;
+    const maxPollMs = 60000;           // backoff ceiling 60s
+    const backoffFactor = 1.8;
+    let failureCount = 0;
+
+    // last-seen markers (prefer ETag)
+    let lastSeenName = null;
+    let lastSeenEtag = null;
+    let lastSeenLastModified = null;
+
+    // SSE client
+    let evtSource = null;
+    let sseReconnectMs = 1000;
+    const sseMaxReconnectMs = 30000;
+    function startSSE(){
+      if(typeof EventSource === 'undefined') return false;
+      if(evtSource) return true;
+      try {
+        evtSource = new EventSource('/events');
+        evtSource.onopen = ()=> { console.info('SSE open'); sseReconnectMs = 1000; };
+        evtSource.onmessage = (ev)=>{
+          try {
+            const msg = JSON.parse(ev.data);
+            // expected message structure: { type: 'blob', name, etag, lastModified } or { type: 'list', items: [...] }
+            if(msg.type === 'blob'){
+              // If a new blob arrived, trigger immediate update
+              if(msg.etag && msg.etag !== lastSeenEtag || (!msg.etag && msg.lastModified !== lastSeenLastModified) || msg.name !== lastSeenName){
+                console.info('SSE: new blob event', msg);
+                // ensure list+viewer are updated
+                awaitLoadLatest();
+              }
+            } else if(msg.type === 'list' && Array.isArray(msg.items)){
+              // server can push full list -> render and maybe load newest
+              handleServerList(msg.items);
+            }
+          } catch(e){ console.warn('SSE parse error', e); }
+        };
+        evtSource.onerror = (e)=>{
+          console.warn('SSE error', e);
+          // close and schedule reconnect
+          try { evtSource.close(); } catch(_) {}
+          evtSource = null;
+          setTimeout(()=> { sseReconnectMs = Math.min(sseMaxReconnectMs, sseReconnectMs * 1.5); startSSE(); }, sseReconnectMs);
+        };
+        return true;
+      } catch(e){
+        console.warn('SSE not available', e);
+        evtSource = null;
+        return false;
+      }
+    }
+
+    function stopSSE(){
+      if(evtSource){ try{ evtSource.close(); }catch(_){} evtSource = null; }
+    }
+
+    function handleServerList(items){
+      // items expected: [{ name, etag, lastModified }, ...] newest first
+      if(!items || items.length === 0) return;
+      const newest = items[0];
+      if(newest.etag) {
+        if(newest.etag !== lastSeenEtag) { lastSeenEtag = newest.etag; lastSeenName = newest.name; lastSeenLastModified = newest.lastModified; awaitLoadLatest(); }
+      } else if(newest.lastModified){
+        if(newest.lastModified !== lastSeenLastModified) { lastSeenLastModified = newest.lastModified; lastSeenName = newest.name; awaitLoadLatest(); }
+      } else {
+        // fallback by name
+        if(newest.name !== lastSeenName) { lastSeenName = newest.name; awaitLoadLatest(); }
+      }
+    }
+
+    // helper to call loadLatest but avoid overlapping calls
+    let pendingLoad = false;
+    async function awaitLoadLatest(){
+      if(pendingLoad) return;
+      pendingLoad = true;
+      try { await loadLatest(); } catch(e){ console.warn('awaitLoadLatest err', e); }
+      pendingLoad = false;
+    }
+
+    function toggleAutoRefresh(on) {
+      autoRefresh = typeof on === 'boolean' ? on : !autoRefresh;
+      const btn = document.getElementById('autoRefreshToggle');
+      btn.textContent = `Auto refresh: ${autoRefresh ? 'On' : 'Off'}`;
+      if (autoRefresh) {
+        // try SSE first; if not available, start polling
+        const sseOk = startSSE();
+        if(!sseOk) startPolling();
+      } else {
+        stopPolling();
+        stopSSE();
+      }
+    }
+
+    function startPolling(){
+      stopPolling();
+      // use a self-scheduling loop so we can change next interval based on success/failure
+      const loop = async ()=>{
+        if(!autoRefresh) return;
+        try {
+          const containerUrl = document.getElementById('containerUrl').value.trim() || null;
+          const sas = document.getElementById('sas').value.trim();
+          const items = await listBlobs(accountEl.account, accountEl.container, sas, containerUrl);
+          if(items && items.length){
+            const newest = items[0];
+            // prefer ETag if present
+            const newestEtag = newest.etag || null;
+            const newestLM = newest.lastModified || null;
+            const changed = (newestEtag && newestEtag !== lastSeenEtag) ||
+                            (!newestEtag && newestLM && newestLM !== lastSeenLastModified) ||
+                            (newest.name && newest.name !== lastSeenName && !newestEtag && !newestLM);
+            if(changed){
+              lastSeenEtag = newestEtag; lastSeenLastModified = newestLM; lastSeenName = newest.name;
+              currentItems = items;
+              renderList(items);
+              await loadItem(0);
+            } else {
+              // update list UI (timestamps) without reloading image
+              currentItems = items;
+              renderList(items);
+            }
+          }
+          // success => reduce backoff
+          failureCount = 0;
+          currentPollMs = basePollMs;
+        } catch(e){
+          console.warn('Polling error', e);
+          failureCount++;
+          currentPollMs = Math.min(maxPollMs, Math.max(basePollMs, currentPollMs * backoffFactor));
+        } finally {
+          // schedule next iteration only if autoRefresh still true and SSE not active
+          if(autoRefresh && !evtSource) pollHandle = setTimeout(loop, currentPollMs);
+        }
+      };
+      // start immediately
+      loop();
+    }
+
+    function stopPolling(){
+      if(pollHandle) { clearTimeout(pollHandle); pollHandle = null; }
+    }
+
+    // load saved settings from localStorage and populate hidden inputs
+    function loadSavedSettings(){
+      const s = JSON.parse(localStorage.getItem('fruta.settings') || '{}');
+      if(s.containerUrl) document.getElementById('containerUrl').value = s.containerUrl;
+      if(s.sas) document.getElementById('sas').value = s.sas;
+      if(s.account) accountEl.account = s.account;
+      if(s.container) accountEl.container = s.container;
+
+      // settings overlay fields
+      document.getElementById('settingsContainerUrl').value = s.containerUrl || '';
+      document.getElementById('settingsSas').value = s.sas || '';
+      document.getElementById('settingsAccount').value = s.account || accountEl.account;
+      document.getElementById('settingsContainer').value = s.container || accountEl.container;
+    }
+
+    function openSettings(){
+      document.getElementById('settingsOverlay').style.display = 'flex';
+    }
+    function closeSettings(){
+      document.getElementById('settingsOverlay').style.display = 'none';
+    }
+
+    document.getElementById('settingsBtn').addEventListener('click', openSettings);
+    document.getElementById('closeSettings').addEventListener('click', closeSettings);
+    document.getElementById('saveSettings').addEventListener('click', ()=>{
+      const s = {
+        containerUrl: document.getElementById('settingsContainerUrl').value.trim() || '',
+        sas: document.getElementById('settingsSas').value.trim() || '',
+        account: document.getElementById('settingsAccount').value.trim() || accountEl.account,
+        container: document.getElementById('settingsContainer').value.trim() || accountEl.container
+      };
+      localStorage.setItem('fruta.settings', JSON.stringify(s));
+      loadSavedSettings();
+      closeSettings();
+    });
+
+    // init saved values on load
+    loadSavedSettings();
+
+    // wire up auto-refresh button and restore persisted state
+    document.getElementById('autoRefreshToggle').addEventListener('click', ()=>{
+      toggleAutoRefresh();
+      localStorage.setItem('fruta.autoRefresh', JSON.stringify(autoRefresh));
+    });
+    // restore previous state (do not start polling unless it was ON)
+    try {
+      const wasOn = JSON.parse(localStorage.getItem('fruta.autoRefresh') || 'false');
+      if(wasOn) toggleAutoRefresh(true);
+      else {
+        // ensure button label matches Off state
+        document.getElementById('autoRefreshToggle').textContent = 'Auto refresh: Off';
+      }
+    } catch(e){ /* ignore malformed storage */ }
+
+    async function listBlobs(account, container, sas, containerUrl){
+      let url;
+      if(containerUrl){
+        try { const u = new URL(containerUrl);
+          if(!u.searchParams.has('restype') && !u.search.includes('comp=list')) u.search += (u.search ? '&' : '?') + 'restype=container&comp=list';
+          url = u.toString();
+        } catch(e){ throw new Error('Invalid container URL'); }
+      } else {
+        url = `https://${account}.blob.core.windows.net/${container}?restype=container&comp=list${sas ? sas : ''}`;
+      }
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('List failed: '+res.status);
+      const text = await res.text();
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(text, "application/xml");
+      // parse each <Blob> entry and extract Name, Properties/Last-Modified, Properties/Etag
+      const blobs = Array.from(doc.querySelectorAll("Blob")).map(b=>{
+        const nameEl = b.querySelector("Name");
+        const props = b.querySelector("Properties");
+        const lastModified = props ? (props.querySelector("Last-Modified") ? props.querySelector("Last-Modified").textContent : null) : null;
+        const etag = props ? (props.querySelector("Etag") ? props.querySelector("Etag").textContent : (props.querySelector("Etag") ? props.querySelector("Etag").textContent : null)) : null;
+        // Some XML responses use <Etag> or <Etag> with casing differences; try multiple selectors
+        let resolvedEtag = null;
+        const eCandidates = ["Etag","Etag","Etag","Etag"];
+        // also try direct Etag under Blob if present
+        if(b.querySelector("Etag")) resolvedEtag = b.querySelector("Etag").textContent;
+        if(!resolvedEtag && props && props.querySelector("Etag")) resolvedEtag = props.querySelector("Etag").textContent;
+        // fallback to other eTag casing
+        if(!resolvedEtag && b.querySelector("ETag")) resolvedEtag = b.querySelector("ETag").textContent;
+        return { name: nameEl ? nameEl.textContent : '', lastModified, etag: resolvedEtag };
+      }).sort((a,b)=> new Date(b.lastModified || 0) - new Date(a.lastModified || 0));
+      return blobs;
+    }
+
+    async function fetchBlobText(account, container, name, sas, containerUrl){
+      let url;
+      if(containerUrl){
+        const u = new URL(containerUrl);
+        url = `${u.origin}/${u.pathname.replace(/^\/+|\/+$/g,'')}/${encodeURIComponent(name)}${u.search || sas || ''}`;
+      } else {
+        url = `https://${account}.blob.core.windows.net/${container}/${encodeURIComponent(name)}${sas || ''}`;
+      }
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('Fetch blob failed: '+res.status);
+      return await res.text();
+    }
+
+    function decodeEnvelopeLine(line){
+      try {
+        const env = JSON.parse(line);
+        if(env.Body){
+          try { const decoded = atob(env.Body); return JSON.parse(decoded); } catch(e){ return { rawBody: env.Body }; }
+        }
+        return env;
+      } catch(e){ return null; }
+    }
+
+    document.getElementById('go').addEventListener('click', loadLatest);
+    let currentItems = [], selectedIndex = -1;
+    // ensure auto-refresh state persists for this session (optional)
+    // toggleAutoRefresh(JSON.parse(localStorage.getItem('fruta.autoRefresh') || 'false'));
+    // If you want to persist toggle state, uncomment and write to localStorage when toggling.
+
+    async function loadLatest(){
+      const containerUrl = document.getElementById('containerUrl').value.trim() || null;
+      const sas = document.getElementById('sas').value.trim();
+      setStatus('Listing blobs...', true);
+      try {
+        const items = await listBlobs(accountEl.account, accountEl.container, sas, containerUrl);
+        currentItems = items;
+        renderList(items);
+        if(items.length) {
+          // update lastSeen markers when user manually loads latest
+          const newest = items[0];
+          lastSeenName = newest.name;
+          lastSeenEtag = newest.etag || lastSeenEtag;
+          lastSeenLastModified = newest.lastModified || lastSeenLastModified;
+          await loadItem(0);
+        } else {
+          setStatus('No blobs found', false);
+        }
+      } catch(e){ setStatus('Error: ' + e.message, false); }
+    }
+
+    function renderList(items){
+      const list = document.getElementById('list'); list.innerHTML='';
+      items.forEach((it, idx)=>{
+        const div = document.createElement('div'); div.className='list-item';
+        div.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center">
+            <div><strong>${it.name}</strong><div class="time">${it.lastModified || ''}</div></div>
+            <div class="muted">#${idx+1}</div>
+          </div>`;
+        div.onclick = ()=> loadItem(idx);
+        list.appendChild(div);
+      });
+    }
+
+    async function loadItem(idx){
+      selectedIndex = idx;
+      const it = currentItems[idx];
+      document.getElementById('analyzeSelected').disabled = false;
+      setStatus('Loading blob: '+it.name, true);
+      const containerUrl = document.getElementById('containerUrl').value.trim() || null;
+      const sas = document.getElementById('sas').value.trim();
+      try {
+        const text = await fetchBlobText(accountEl.account, accountEl.container, it.name, sas, containerUrl);
+        setStatus('Parsing blob', false);
+        const lines = text.split(/\r?\n/).filter(l=>l.trim());
+        const payloads = lines.map(l=>decodeEnvelopeLine(l)).filter(Boolean);
+        let chosen = payloads.find(p=>p.imageFileName||p.blobUrl) || payloads[0] || {};
+        renderViewer(chosen, accountEl.account, accountEl.container, sas, containerUrl);
+        updateChart(payloads);
+        // if auto-refresh is enabled we keep polling (no-op here) — polling checks for newer blobs automatically
+      } catch(e){ setStatus('Error: '+e.message, false); }
+    }
+
+    function renderViewer(payload, account, container, sas, containerUrl){
+      const imgwrap = document.getElementById('imgwrap'); imgwrap.innerHTML='';
+      const info = document.getElementById('photoInfo'); info.textContent='';
+      const badge = document.getElementById('detectionBadge'); badge.style.display='none';
+
+      let imgUrl = null;
+      if(payload && payload.blobUrl) imgUrl = payload.blobUrl;
+      else if(payload && payload.imageFileName){
+        if(containerUrl){ const u = new URL(containerUrl); imgUrl = `${u.origin}/${u.pathname.replace(/^\/+|\/+$/g,'')}/${payload.imageFileName}${u.search || ''}`; }
+        else imgUrl = `https://${account}.blob.core.windows.net/${container}/${encodeURIComponent(payload.imageFileName)}${sas||''}`;
+      }
+
+      if(imgUrl){
+        const img = document.createElement('img'); img.src = imgUrl; img.alt='photo';
+        imgwrap.appendChild(img);
+        if(payload.timestamp) info.textContent = payload.timestamp;
+        if(payload.mangoLikelihood || payload.prediction || payload.score){
+          badge.style.display='inline-block';
+          const score = payload.mangoLikelihood || payload.score || (payload.prediction && payload.prediction.mango) || 0;
+          badge.textContent = typeof score === 'number' ? `MANGO ${(score*100|0)}%` : 'MANGO';
+        }
+      } else {
+        imgwrap.innerHTML = '<div class="muted">No image in this payload</div>';
+      }
+
+      const pre = document.createElement('pre'); pre.style.marginTop='8px';
+      pre.textContent = JSON.stringify(payload, null, 2);
+      imgwrap.appendChild(pre);
+    }
+
+    function setStatus(msg, busy){
+      document.title = busy ? `⏳ ${msg}` : `FRUTA Telemetry Viewer`;
+      const badge = document.getElementById('photoInfo'); if(!busy) badge.title = '';
+    }
+
+    let chart = null;
+    function updateChart(payloads){
+      const labels = [];
+      const data = [];
+      const map = {};
+      payloads.forEach(p=>{
+        const t = p.timestamp || p.time || p.eventTime || new Date().toISOString();
+        const minute = (new Date(t)).toISOString().slice(0,16).replace('T',' ');
+        const score = p.mangoLikelihood || (p.prediction && (p.prediction.mango || p.prediction['Mango'])) || 0;
+        map[minute] = map[minute] || {count:0,scoreSum:0};
+        map[minute].count += (score && score>0.3) ? 1 : 0;
+        map[minute].scoreSum += (typeof score === 'number') ? score : 0;
+      });
+      Object.keys(map).sort().forEach(k=>{
+        labels.push(k); data.push(map[k].count);
+      });
+
+      const ctx = document.getElementById('trendChart').getContext('2d');
+      if(chart) { chart.data.labels = labels; chart.data.datasets[0].data = data; chart.update(); return; }
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ label: 'Mango detections (per minute)', data, backgroundColor: '#0ea5a4' }]},
+        options: { responsive:true, plugins:{legend:{display:false}}, scales:{x:{ticks:{maxRotation:0}}, y:{beginAtZero:true}} }
+      });
+    }
+
+    document.getElementById('analyzeSelected').addEventListener('click', async ()=>{
+      if(selectedIndex < 0) return;
+      const it = currentItems[selectedIndex];
+      try {
+        const resp = await fetch('/api/analyze', {
+          method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ blobName: it.name })
+        });
+        const j = await resp.json();
+        alert('Analyze result: ' + JSON.stringify(j.prediction || j, null, 2));
+      } catch(e){ alert('Analyze failed: '+e.message); }
+    });
+  </script>
+</body>
+</html>
