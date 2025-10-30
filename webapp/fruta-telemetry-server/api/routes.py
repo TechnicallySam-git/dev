@@ -4,6 +4,9 @@ import requests
 import os
 import time
 import json
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+import re
 
 api = Blueprint('api', __name__)
 
@@ -17,6 +20,30 @@ def load_latest():
     sas_token = request.args.get('sas') or current_app.config.get('SAS_TOKEN')
     try:
         items = list_blobs(container_url=container_url, sas_token=sas_token)
+        # Normalize ordering: attempt to sort by lastModified (RFC1123) then by filename timestamp (YYYYMMDD-HHMMSS)
+        def _item_ts(it):
+            lm = it.get('lastModified')
+            if lm:
+                try:
+                    return parsedate_to_datetime(lm).timestamp()
+                except Exception:
+                    pass
+            # try to extract timestamp from filename like ...-YYYYMMDD-HHMMSS.jpg
+            name = it.get('name') or ''
+            m = re.search(r'(\d{8}-\d{6})', name)
+            if m:
+                try:
+                    return datetime.strptime(m.group(1), '%Y%m%d-%H%M%S').timestamp()
+                except Exception:
+                    pass
+            return 0
+
+        try:
+            items.sort(key=_item_ts, reverse=True)
+        except Exception:
+            # fallback: reverse list if sort fails for any reason
+            items = list(reversed(items))
+
         return jsonify({'items': items}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500

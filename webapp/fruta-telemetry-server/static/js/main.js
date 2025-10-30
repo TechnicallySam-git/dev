@@ -21,6 +21,10 @@ document.addEventListener('DOMContentLoaded', () => {
             .then(response => response.json())
             .then(data => {
                 currentItems = data.items;
+                // reverse so newest items show first (top)
+                if (Array.isArray(currentItems) && currentItems.length > 1) {
+                    currentItems.reverse();
+                }
                 renderList(currentItems);
                 if (currentItems.length > 0) {
                     loadItem(0);
@@ -51,7 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
         detectionBadge.style.display = 'none';
 
         const img = document.createElement('img');
-        img.src = item.url; // Assuming item.url contains the image URL
+        img.src = '/api/fetch_blob_content?name=' + encodeURIComponent(item.name);
         img.alt = 'Telemetry Image';
         imgWrap.appendChild(img);
 
@@ -64,8 +68,75 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function toggleAutoRefresh() {
-        // Implement auto-refresh logic here
+    // Auto-refresh controller
+    let autoRefreshEnabled = false;
+    let _sse = null;
+    let _pollTimer = null;
+
+    function updateAutoRefreshButton() {
+        const btn = document.getElementById('auto-refresh-btn');
+        if (!btn) return;
+        btn.textContent = autoRefreshEnabled ? 'Auto refresh: ON' : 'Auto refresh: OFF';
+        btn.classList.toggle('active', autoRefreshEnabled);
+    }
+
+    function startPolling() {
+        stopPolling();
+        // poll every 5s
+        _pollTimer = setInterval(() => {
+            if (typeof awaitLoadLatest === 'function') awaitLoadLatest();
+            else if (typeof loadLatest === 'function') loadLatest();
+        }, 5000);
+    }
+
+    function stopPolling() {
+        if (_pollTimer) {
+            clearInterval(_pollTimer);
+            _pollTimer = null;
+        }
+    }
+
+    function startSSE() {
+        stopSSE();
+        try {
+            _sse = new EventSource('/events');
+            _sse.onopen = () => console.info('SSE open');
+            _sse.onmessage = (ev) => {
+                // server sent notification -> refresh list
+                if (typeof awaitLoadLatest === 'function') awaitLoadLatest();
+                else if (typeof loadLatest === 'function') loadLatest();
+            };
+            _sse.onerror = (e) => {
+                console.warn('SSE error, falling back to polling', e);
+                stopSSE();
+                startPolling();
+            };
+        } catch (e) {
+            console.warn('SSE not supported, using polling', e);
+            startPolling();
+        }
+    }
+
+    function stopSSE() {
+        if (_sse) {
+            _sse.close();
+            _sse = null;
+        }
+    }
+
+    function toggleAutoRefresh(forceState) {
+        autoRefreshEnabled = (typeof forceState === 'boolean') ? forceState : !autoRefreshEnabled;
+        updateAutoRefreshButton();
+        if (autoRefreshEnabled) {
+            // prefer SSE, fallback to polling inside startSSE
+            startSSE();
+            // do an immediate refresh
+            if (typeof awaitLoadLatest === 'function') awaitLoadLatest();
+            else if (typeof loadLatest === 'function') loadLatest();
+        } else {
+            stopSSE();
+            stopPolling();
+        }
     }
 
     function analyzeSelected() {

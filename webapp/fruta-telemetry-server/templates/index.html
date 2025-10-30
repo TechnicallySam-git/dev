@@ -459,7 +459,7 @@
       if(!currentItems || index < 0 || index >= currentItems.length) return;
       currentIndex = index;
       const it = currentItems[index];
-      let blobUrl = it.url || null;
+      let blobUrl = it.name ? ('/api/fetch_blob_content?name=' + encodeURIComponent(it.name)) : null;
       if(!blobUrl) {
         // resolve via backend
         try {
@@ -499,7 +499,7 @@
       const it = currentItems[currentIndex];
       // prefer blob url if present
       const payload = {};
-      if(it.url) payload.blobUrl = it.url;
+      if(it.name) payload.blobUrl = '/api/fetch_blob_content?name=' + encodeURIComponent(it.name);
       else payload.blobName = it.name;
 
       // include client-side containerUrl/sas if configured so server can resolve correctly
@@ -571,6 +571,8 @@
 
     // initial action: attempt to load latest on first open
     awaitLoadLatest();
+    // start auto-refresh (SSE preferred) so UI updates when new blobs arrive
+    toggleAutoRefresh(true);
   </script>
 </body>
 </html>
