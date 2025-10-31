@@ -1,162 +1,227 @@
 from azure.storage.blob import BlobServiceClient
-import os
-import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from xml.etree import ElementTree as ET
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime, format_datetime
+import os
+import requests
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+def _append_sas(url, sas_token):
+    """Append SAS token to url using '?' or '&' as appropriate."""
+    if not sas_token:
+        return url
+    token = str(sas_token).lstrip('?&')
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}{token}"
 
 def _build_sas_suffix(sas_token):
     if not sas_token:
         return ''
-    return sas_token if sas_token.startswith('?') else ('?' + sas_token)
+    s = str(sas_token)
+    return ('?' + s.lstrip('?')) if s else ''
 
 def _format_rfc1123(dt):
     if not dt:
         return None
-    # dt expected to be datetime; ensure UTC
-    try:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-    except Exception:
-        return None
-
-def list_blobs(container_url=None, sas_token=None):
-    """
-    Return list of blobs as dicts: { name, lastModified, etag, url }.
-    Prefer using SDK when AZURE_STORAGE_CONNECTION_STRING is present; otherwise use existing REST/XML logic.
-    If network/credentials missing, returns empty list (preserves original behavior).
-    """
-    # Prefer SDK if connection string is available and no explicit container_url was provided
-    conn = os.getenv('AZURE_STORAGE_CONNECTION_STRING')
-    if conn and not container_url:
+    if isinstance(dt, str):
+        return dt
+    if isinstance(dt, datetime):
+        # ensure UTC and RFC1123 format
         try:
-            svc = BlobServiceClient.from_connection_string(conn)
-            container = os.getenv('AZURE_STORAGE_CONTAINER_NAME') or os.getenv('CONTAINER_NAME')
-            if not container:
-                return []
-            cl = svc.get_container_client(container)
-            items = []
-            for blob in cl.list_blobs():
-                blob_client = svc.get_blob_client(container=container, blob=blob.name)
-                items.append({
-                    'name': blob.name,
-                    'lastModified': _format_rfc1123(getattr(blob, 'last_modified', None)),
-                    'etag': getattr(blob, 'etag', None),
-                    'url': blob_client.url
-                })
-            items.sort(key=lambda i: i.get('lastModified') or '', reverse=True)
-            return items
+            d = dt.astimezone(timezone.utc)
+            # format_datetime returns RFC 5322 style; produce RFC1123-compatible string
+            return d.strftime('%a, %d %b %Y %H:%M:%S GMT')
         except Exception:
-            return []
+            return dt.isoformat()
+    return str(dt)
 
-    # allow caller provided SAS fallback to env
-    sas_token = sas_token or os.getenv('SAS_TOKEN')
-
-    # If container_url was provided, request it (ensure comp=list/restype=container is present)
-    if container_url:
+def _blob_ts(it):
+    # normalize lastModified RFC1123 -> timestamp, fallback to filename timestamp, else 0
+    lm = it.get('lastModified')
+    if lm:
         try:
-            u = urlparse(container_url)
-            q = u.query
-            if 'comp=list' not in q and 'restype=container' not in q:
-                sep = '&' if q else '?'
-                container_url = container_url + f"{sep}restype=container&comp=list"
-            resp = requests.get(container_url, timeout=10)
-            resp.raise_for_status()
-            xml = ET.fromstring(resp.text)
-            items = []
-            for blob in xml.findall('.//Blob'):
-                name_el = blob.find('Name')
-                props = blob.find('Properties')
-                last_mod = props.findtext('Last-Modified') if props is not None else None
-                etag = props.findtext('Etag') if props is not None else None
-                name = name_el.text if name_el is not None else ''
-                origin = f"{u.scheme}://{u.netloc}"
-                path = u.path.rstrip('/')
-                blob_url = f"{origin}{path}/{name}{_build_sas_suffix(sas_token or ('?' + u.query if u.query else ''))}"
-                items.append({'name': name, 'lastModified': last_mod, 'etag': etag, 'url': blob_url})
-            items.sort(key=lambda i: i.get('lastModified') or '', reverse=True)
-            return items
+            # parsedate_to_datetime handles RFC1123-like strings
+            return parsedate_to_datetime(lm).timestamp()
         except Exception:
-            return []
-
-    # If no container_url and no SDK conn, try using account/container from env (existing REST path)
-    account = os.getenv('ACCOUNT_NAME')
-    container = os.getenv('CONTAINER_NAME')
-    if account and container:
+            try:
+                # maybe it's an ISO string
+                return datetime.fromisoformat(lm).timestamp()
+            except Exception:
+                pass
+    # try filename pattern like YYYYMMDD-HHMMSS
+    name = it.get('name') or ''
+    m = re.search(r'(\d{8}-\d{6})', name)
+    if m:
         try:
-            base = f"https://{account}.blob.core.windows.net/{container}"
-            list_url = f"{base}?restype=container&comp=list{_build_sas_suffix(sas_token)}"
-            resp = requests.get(list_url, timeout=10)
-            resp.raise_for_status()
-            xml = ET.fromstring(resp.text)
-            items = []
-            for blob in xml.findall('.//Blob'):
-                name_el = blob.find('Name')
-                props = blob.find('Properties')
-                last_mod = props.findtext('Last-Modified') if props is not None else None
-                etag = props.findtext('Etag') if props is not None else None
-                name = name_el.text if name_el is not None else ''
-                blob_url = f"{base}/{name}{_build_sas_suffix(sas_token)}"
-                items.append({'name': name, 'lastModified': last_mod, 'etag': etag, 'url': blob_url})
-            items.sort(key=lambda i: i.get('lastModified') or '', reverse=True)
-            return items
-        except Exception:
-            return []
-
-    # No credentials / info available — return a minimal mocked list so UI/tests still work
-    return [{'name': 'example.jpg', 'lastModified': None, 'etag': None, 'url': f'https://example.invalid/example.jpg'}]
-
-def fetch_blob_data(container_url=None, blob_name=None, sas_token=None):
-    if not blob_name:
-        raise ValueError('blob_name required')
-
-    account = os.getenv('ACCOUNT_NAME')
-    container = os.getenv('CONTAINER_NAME')
-    sas_token = sas_token or os.getenv('SAS_TOKEN')
-
-    if container_url:
-        try:
-            u = urlparse(container_url)
-            origin = f"{u.scheme}://{u.netloc}"
-            path = u.path.rstrip('/')
-            blob_url = f"{origin}{path}/{blob_name}{_build_sas_suffix(sas_token or ('?' + u.query if u.query else ''))}"
-            return {'name': blob_name, 'blob_url': blob_url}
+            return datetime.strptime(m.group(1), '%Y%m%d-%H%M%S').timestamp()
         except Exception:
             pass
-
-    if account and container:
-        blob_url = f"https://{account}.blob.core.windows.net/{container}/{blob_name}{_build_sas_suffix(sas_token)}"
-        return {'name': blob_name, 'blob_url': blob_url}
-
-    return {'name': blob_name, 'blob_url': f'https://example.invalid/{blob_name}'}
+    return 0
 
 class BlobService:
-    def __init__(self):
-        self.blob_service_client = BlobServiceClient.from_connection_string(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
-        self.container_name = os.getenv("AZURE_STORAGE_CONTAINER_NAME")
+    """
+    Thin wrapper that tries SDK if AZURE_STORAGE_CONNECTION_STRING is set,
+    otherwise uses container_url + SAS (if provided) and simple REST calls.
+    """
+
+    def __init__(self, container_url=None, sas_token=None):
+        self.conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        self.account = os.getenv("AZURE_STORAGE_ACCOUNT") or os.getenv("ACCOUNT_NAME")
+        self.container_env = os.getenv("AZURE_STORAGE_CONTAINER_NAME") or os.getenv("CONTAINER_NAME")
+        self.container_url = container_url or os.getenv("AZURE_CONTAINER_URL") or (f"https://{self.account}.blob.core.windows.net/{self.container_env}" if self.account and self.container_env else None)
+        self.sas_token = sas_token or os.getenv("SAS_TOKEN")
+        # remove previous prebuilt suffix; use _append_sas at call sites
+        self._sdk = None
+        if self.conn_str:
+            try:
+                self._sdk = BlobServiceClient.from_connection_string(self.conn_str)
+            except Exception:
+                self._sdk = None
 
     def list_blobs(self):
-        container_client = self.blob_service_client.get_container_client(self.container_name)
         items = []
-        for blob in container_client.list_blobs():
-            last_mod = getattr(blob, 'last_modified', None)
-            last_mod_str = _format_rfc1123(last_mod)
-            blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob.name)
-            items.append({
-                'name': blob.name,
-                'lastModified': last_mod_str,
-                'etag': getattr(blob, 'etag', None),
-                'url': blob_client.url
-            })
-        items.sort(key=lambda i: i.get('lastModified') or '', reverse=True)
-        return items
+        # SDK path
+        if self._sdk:
+            try:
+                container_name = self.container_env
+                if not container_name:
+                    # try to get from container_url if available
+                    if self.container_url:
+                        u = urlparse(self.container_url)
+                        # path like /container
+                        container_name = u.path.strip('/').split('/')[-1]
+                if not container_name:
+                    raise RuntimeError("container name not configured (AZURE_STORAGE_CONTAINER_NAME or container_url required)")
 
-    def get_blob_url(self, blob_name):
-        blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
-        return blob_client.url
+                cl = self._sdk.get_container_client(container_name)
+                for blob in cl.list_blobs():
+                    blob_client = self._sdk.get_blob_client(container=container_name, blob=blob.name)
+                    items.append({
+                        'name': blob.name,
+                        'lastModified': _format_rfc1123(getattr(blob, 'last_modified', None)),
+                        'etag': getattr(blob, 'etag', None),
+                        'url': blob_client.url
+                    })
+                # sort by timestamp (newest first)
+                items.sort(key=_blob_ts, reverse=True)
+                return items
+            except Exception:
+                # fallthrough to REST attempt if SDK listing fails
+                pass
+
+        # REST path using container_url + ?restype=container&comp=list (requires SAS or public container)
+        if not self.container_url:
+            return []  # nothing we can do
+        try:
+            u = self.container_url.rstrip('/')
+            list_url = f"{u}?restype=container&comp=list"
+            list_url = _append_sas(list_url, self.sas_token)
+            r = requests.get(list_url, timeout=15)
+            r.raise_for_status()
+            xml = ET.fromstring(r.content)
+            for blob in xml.findall('.//Blob'):
+                name_el = blob.find('Name')
+                props = blob.find('Properties')
+                last_mod = props.findtext('Last-Modified') if props is not None else None
+                etag = props.findtext('Etag') if props is not None else None
+                name = name_el.text if name_el is not None else ''
+                blob_url = f"{u}/{name}"
+                blob_url = _append_sas(blob_url, self.sas_token)
+                items.append({'name': name, 'lastModified': last_mod, 'etag': etag, 'url': blob_url})
+            items.sort(key=_blob_ts, reverse=True)
+            return items
+        except Exception:
+            return []
+
+    def fetch_blob_data(self, blob_name):
+        """
+        Return metadata dict for blob (including blob_url).
+        """
+        if not blob_name:
+            raise ValueError("blob_name required")
+
+        # SDK path
+        if self._sdk:
+            try:
+                container_name = self.container_env
+                if not container_name and self.container_url:
+                    u = urlparse(self.container_url)
+                    container_name = u.path.strip('/').split('/')[-1]
+                if not container_name:
+                    raise RuntimeError("container name not configured")
+
+                blob_client = self._sdk.get_blob_client(container=container_name, blob=blob_name)
+                props = blob_client.get_blob_properties()
+                return {
+                    'name': blob_name,
+                    'lastModified': _format_rfc1123(getattr(props, 'last_modified', None)),
+                    'etag': getattr(props, 'etag', None),
+                    'blob_url': blob_client.url
+                }
+            except Exception:
+                # fall back to REST below
+                pass
+
+        # REST path
+        if not self.container_url:
+            raise RuntimeError("container_url or connection string required to resolve blob url")
+        u = self.container_url.rstrip('/')
+        blob_url = f"{u}/{blob_name}"
+        blob_url = _append_sas(blob_url, self.sas_token)
+        # try a HEAD to get properties if permitted
+        try:
+            r = requests.head(blob_url, timeout=10)
+            if r.status_code in (200, 206):
+                last_mod = r.headers.get('Last-Modified') or r.headers.get('last-modified')
+                etag = r.headers.get('ETag') or r.headers.get('etag')
+                return {'name': blob_name, 'lastModified': last_mod, 'etag': etag, 'blob_url': blob_url}
+        except Exception:
+            pass
+        # best-effort
+        return {'name': blob_name, 'lastModified': None, 'etag': None, 'blob_url': blob_url}
 
     def fetch_blob_content(self, blob_name):
-        blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
-        stream = blob_client.download_blob()
-        return stream.readall()
+        """
+        Return raw bytes for blob_name. Uses SDK if available, else HTTP GET.
+        """
+        if not blob_name:
+            raise ValueError("blob_name required")
+
+        # SDK path
+        if self._sdk:
+            try:
+                container_name = self.container_env
+                if not container_name and self.container_url:
+                    u = urlparse(self.container_url)
+                    container_name = u.path.strip('/').split('/')[-1]
+                blob_client = self._sdk.get_blob_client(container=container_name, blob=blob_name)
+                stream = blob_client.download_blob()
+                return stream.readall()
+            except Exception:
+                pass
+
+        # REST path
+        if not self.container_url:
+            raise RuntimeError("container_url or connection string required to fetch blob content")
+        blob_url = f"{self.container_url.rstrip('/')}/{blob_name}"
+        blob_url = _append_sas(blob_url, self.sas_token)
+        r = requests.get(blob_url, timeout=30)
+        r.raise_for_status()
+        return r.content
+
+# Module-level convenience wrappers used by the app
+def list_blobs(container_url=None, sas_token=None):
+    svc = BlobService(container_url=container_url, sas_token=sas_token)
+    return svc.list_blobs()
+
+def fetch_blob_data(container_url=None, blob_name=None, sas_token=None):
+    svc = BlobService(container_url=container_url, sas_token=sas_token)
+    return svc.fetch_blob_data(blob_name)
+
+def fetch_blob_content(container_url=None, blob_name=None, sas_token=None):
+    svc = BlobService(container_url=container_url, sas_token=sas_token)
+    return svc.fetch_blob_content(blob_name)

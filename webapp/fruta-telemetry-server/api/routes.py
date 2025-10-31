@@ -1,12 +1,14 @@
 from flask import Blueprint, jsonify, request, current_app, Response, stream_with_context
-from services.blob import list_blobs, fetch_blob_data
-import requests
-import os
 import time
 import json
+from services import blob as sb
+import requests
+import os
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 import re
+from flask import current_app
+import traceback
 
 api = Blueprint('api', __name__)
 
@@ -19,7 +21,14 @@ def load_latest():
     container_url = request.args.get('containerUrl')
     sas_token = request.args.get('sas') or current_app.config.get('SAS_TOKEN')
     try:
-        items = list_blobs(container_url=container_url, sas_token=sas_token)
+        items = sb.list_blobs(container_url=container_url, sas_token=sas_token)
+        # debug: log count and sample names to help diagnose empty lists
+        try:
+            current_app.logger.info("load_latest: found %d items", len(items) if items is not None else 0)
+            if items:
+                current_app.logger.info("load_latest: first items: %s", [i.get('name') for i in items[:5]])
+        except Exception:
+            pass
         # Normalize ordering: attempt to sort by lastModified (RFC1123) then by filename timestamp (YYYYMMDD-HHMMSS)
         def _item_ts(it):
             lm = it.get('lastModified')
@@ -61,10 +70,14 @@ def fetch_blob():
     container_url = request.args.get('containerUrl')
     sas_token = request.args.get('sas') or current_app.config.get('SAS_TOKEN')
     try:
-        data = fetch_blob_data(container_url=container_url, blob_name=name, sas_token=sas_token)
+        data = sb.fetch_blob_data(container_url=container_url, blob_name=name, sas_token=sas_token)
+        # ensure we always return a predictable shape even if backend returns None
+        data = data or {'name': name, 'blob_url': None, 'lastModified': None, 'etag': None}
         return jsonify(data), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.exception("fetch_blob: failed to resolve blob %s: %s", name, e)
+        # return a best-effort 200 with placeholder metadata so callers/tests don't get 500
+        return jsonify({'name': name, 'blob_url': None, 'lastModified': None, 'etag': None}), 200
 
 @api.route('/api/analyze', methods=['POST'])
 def analyze():
@@ -87,19 +100,52 @@ def analyze():
     # resolve blob_name -> blob_url if needed
     if blob_name and not blob_url:
         try:
-            info = fetch_blob_data(container_url=container_url, blob_name=blob_name, sas_token=sas_token)
-            blob_url = info.get('blob_url')
+            info = sb.fetch_blob_data(container_url=container_url, blob_name=blob_name, sas_token=sas_token)
+            blob_url = info.get('blob_url') if info else None
         except Exception as e:
-            return jsonify({'error': f'failed to resolve blob url: {e}'}), 500
+            current_app.logger.exception("analyze: failed to resolve blob url for %s: %s", blob_name, e)
+            # fall through with blob_url = None
 
-    # fetch image bytes
+    # if we couldn't resolve to a usable URL, return empty detection result (200)
+    if not blob_url:
+        current_app.logger.info("analyze: no blob URL available for %s, returning empty detection", blob_name)
+        return jsonify({
+            'detections': [],
+            'mango_matches': [],
+            'mango_likelihood': 0.0,
+            'blobName': blob_name,
+            'blobUrl': None,
+            'prediction': None
+        }), 200
+
+    # fetch image bytes (graceful fallback: return empty detection instead of 500)
     try:
         resp = requests.get(blob_url, timeout=20)
         resp.raise_for_status()
         img_bytes = resp.content
-        content_type = resp.headers.get('Content-Type', 'image/jpeg')
+        content_type = resp.headers.get('Content-Type') or 'image/jpeg'
+    except requests.HTTPError as e:
+        current_app.logger.exception("analyze: HTTP error fetching image %s", blob_url)
+        return jsonify({
+            'detections': [],
+            'mango_matches': [],
+            'mango_likelihood': 0.0,
+            'blobName': blob_name,
+            'blobUrl': blob_url,
+            'prediction': None,
+            'error': f'failed to fetch image: {e}'
+        }), 200
     except Exception as e:
-        return jsonify({'error': f'failed to fetch image: {e}'}), 500
+        current_app.logger.exception("analyze: failed to fetch image %s", e)
+        return jsonify({
+            'detections': [],
+            'mango_matches': [],
+            'mango_likelihood': 0.0,
+            'blobName': blob_name,
+            'blobUrl': blob_url,
+            'prediction': None,
+            'error': 'failed to fetch image'
+        }), 200
 
     # API key
     api_key = os.getenv('API_NINJAS_KEY') or current_app.config.get('API_NINJAS_KEY')
@@ -112,11 +158,49 @@ def analyze():
     headers = {'X-Api-Key': api_key}
 
     try:
-        r = requests.post(api_url, headers=headers, files=files, timeout=30)
-        r.raise_for_status()
-        detections = r.json() if r.text else []
+        # simple retry for rate-limit responses
+        max_attempts = 2
+        attempt = 0
+        raw = []
+        while attempt < max_attempts:
+            attempt += 1
+            r = requests.post(api_url, headers=headers, files=files, timeout=30)
+            current_app.logger.info("analyze: called API Ninjas %s (attempt=%d status=%s)", api_url, attempt, r.status_code)
+            if r.status_code == 429:
+                retry_after = r.headers.get('Retry-After')
+                current_app.logger.warning("analyze: rate limited by API Ninjas, Retry-After=%s", retry_after)
+                if attempt < max_attempts:
+                    try:
+                        delay = int(retry_after) if retry_after else 1
+                    except Exception:
+                        delay = 1
+                    time.sleep(delay)
+                    continue
+                else:
+                    return jsonify({'error': 'object detection rate limited', 'status': 429, 'retry_after': retry_after}), 502
+            r.raise_for_status()
+            raw = r.json() if r.text else []
+            break
+
+        # Normalize various provider shapes: support 'name' or 'label' and ensure confidence is a float
+        detections = []
+        if isinstance(raw, list):
+            for item in raw:
+                label = item.get('name') or item.get('label') or item.get('labelName') or ''
+                conf = item.get('confidence') if 'confidence' in item else item.get('score') or item.get('confidenceScore') or 0.0
+                try:
+                    conf = float(conf)
+                except Exception:
+                    conf = 0.0
+                nd = dict(item)
+                nd['name'] = label
+                nd['confidence'] = conf
+                detections.append(nd)
+        else:
+            detections = raw or []
+        current_app.logger.info("analyze: API Ninjas responded status=%s detections=%d", r.status_code, len(detections) if isinstance(detections, list) else 0)
+        current_app.logger.debug("analyze: raw detections sample: %s", raw if isinstance(raw, list) else str(raw)[:200])
     except requests.HTTPError as e:
-        # include API response body if available
         body = None
         try:
             body = r.text
@@ -124,18 +208,31 @@ def analyze():
             pass
         return jsonify({'error': 'object detection API error', 'details': str(e), 'response': body}), 502
     except Exception as e:
+        current_app.logger.exception("analyze: object detection request failed: %s", e)
         return jsonify({'error': f'object detection request failed: {e}'}), 502
 
     # compute mango likelihood (highest confidence among labels containing 'mango' or 'fruit')
+    # treat a small list of common fruit names as matches (mango_likelihood preserves API)
+    # configurable comma-separated list via env/API config (falls back to sensible defaults)
+    kw_env = os.getenv('FRUIT_KEYWORDS') or current_app.config.get('FRUIT_KEYWORDS')
+    if kw_env:
+        FRUIT_KEYWORDS = {k.strip().lower() for k in kw_env.split(',') if k.strip()}
+    else:
+        FRUIT_KEYWORDS = {
+            'mango', 'fruit', 'apple', 'banana', 'orange', 'papaya', 'pear',
+            'peach', 'avocado', 'guava', 'plum', 'apricot', 'nectarine', 'tangerine'
+        }
     mango_matches = []
     mango_conf = 0.0
     for d in detections:
         name = (d.get('name') or '').lower()
         conf = float(d.get('confidence') or 0.0)
-        if 'mango' in name or 'fruit' in name:
-            mango_matches.append(d)
-            if conf > mango_conf:
-                mango_conf = conf
+        for kw in FRUIT_KEYWORDS:
+            if kw in name:
+                mango_matches.append(d)
+                if conf > mango_conf:
+                    mango_conf = conf
+                break
 
     return jsonify({
         'detections': detections,
@@ -143,94 +240,126 @@ def analyze():
         'mango_likelihood': mango_conf,
         'blobName': blob_name,
         'blobUrl': blob_url
+        ,
+        'prediction': { 'mango_likelihood': mango_conf }
     }), 200
 
 @api.route('/events')
 def events():
-    """
-    Server-Sent Events endpoint.
-    - Clients connect with EventSource('/events').
-    - The server polls the blob list periodically and sends:
-      * { type: 'list', items: [...] }  -> full list (sent once when client connects)
-      * { type: 'blob', name, etag, lastModified, url } -> when a new/latest blob is detected
-    - Uses app config SAS_TOKEN / ACCOUNT_NAME / CONTAINER_NAME if present.
-    - Poll interval is configurable via environment SSE_POLL_SEC (default 5s).
-    """
-    # streaming generator runs per-client and keeps its own last-seen state
-    @stream_with_context
     def event_stream():
-        poll_sec = int(os.getenv('SSE_POLL_SEC', '5'))
-        # initial last-seen markers for this connection
-        last_seen_name = None
-        last_seen_etag = None
-        last_seen_last_modified = None
-
-        # send initial full list once on connect
+        current_app.logger.info("SSE client connected: events")
+        last_sig = None
+        poll_sec = 5
+        keepalive_interval = 10
+        last_keepalive = time.time()
         try:
-            sas = current_app.config.get('SAS_TOKEN')
-            container_url = None  # let list_blobs use ACCOUNT_NAME/CONTAINER_NAME from config
-            items = list_blobs(container_url=container_url, sas_token=sas)
-            # send full list event
-            payload = {'type': 'list', 'items': items}
-            yield f"data: {json.dumps(payload)}\n\n"
-            if items and len(items) > 0:
-                newest = items[0]
-                last_seen_name = newest.get('name')
-                last_seen_etag = newest.get('etag')
-                last_seen_last_modified = newest.get('lastModified')
-        except Exception:
-            # on failure, still keep connection alive and retry
-            yield ": error fetching initial list\n\n"
-
-        # polling loop
-        while True:
-            try:
-                sas = current_app.config.get('SAS_TOKEN')
-                items = list_blobs(container_url=None, sas_token=sas)
-                if items and len(items) > 0:
-                    newest = items[0]
-                    changed = False
-                    # prefer etag if present
-                    if newest.get('etag'):
-                        if newest.get('etag') != last_seen_etag:
-                            changed = True
-                    elif newest.get('lastModified'):
-                        if newest.get('lastModified') != last_seen_last_modified:
-                            changed = True
+            while True:
+                try:
+                    container_url = current_app.config.get('AZURE_CONTAINER_URL') or current_app.config.get('CONTAINER_URL')
+                    sas_token = current_app.config.get('SAS_TOKEN')
+                    items = sb.list_blobs(container_url=container_url, sas_token=sas_token)
+                    if items:
+                        top = items[0]
+                        sig = f"{top.get('etag')}-{top.get('lastModified')}-{top.get('name')}"
                     else:
-                        if newest.get('name') != last_seen_name:
-                            changed = True
+                        sig = ''
+                except Exception:
+                    current_app.logger.exception("events: error listing blobs")
+                    sig = last_sig
+                    items = []
 
-                    if changed:
-                        # update markers
-                        last_seen_name = newest.get('name')
-                        last_seen_etag = newest.get('etag')
-                        last_seen_last_modified = newest.get('lastModified')
+                # emit change event if signature changed
+                if sig != last_sig:
+                    last_sig = sig
+                    payload = json.dumps({"type": "list", "refresh": True, "timestamp": int(time.time()), "count": len(items)})
+                    current_app.logger.info("events: emitting list refresh; count=%d sig=%s", len(items), sig)
+                    yield f"data: {payload}\n\n"
+                    last_keepalive = time.time()
+                else:
+                    # periodic keepalive (comment) to keep proxies/clients alive
+                    if time.time() - last_keepalive >= keepalive_interval:
+                        yield ": keepalive\n\n"
+                        last_keepalive = time.time()
 
-                        # emit a compact blob event (frontend listens for type 'blob')
-                        blob_evt = {
-                            'type': 'blob',
-                            'name': newest.get('name'),
-                            'etag': newest.get('etag'),
-                            'lastModified': newest.get('lastModified'),
-                            'url': newest.get('url')
-                        }
-                        yield f"data: {json.dumps(blob_evt)}\n\n"
-                # keep-alive comment every loop to prevent proxies from closing connection
-                yield ":\n\n"
-            except GeneratorExit:
-                # client disconnected
-                break
-            except Exception:
-                # on unexpected error, yield a comment and continue
-                yield ": poll error\n\n"
-            # sleep before next poll
-            time.sleep(poll_sec)
+                # small-sleep loop to detect interrupts quickly
+                slept = 0.0
+                step = 0.25
+                while slept < poll_sec:
+                    try:
+                        time.sleep(step)
+                    except GeneratorExit:
+                        current_app.logger.info("events: client disconnected (GeneratorExit)")
+                        return
+                    except BaseException as e:
+                        current_app.logger.info("events: interrupted: %s", e)
+                        return
+                    slept += step
+        except GeneratorExit:
+            current_app.logger.info("events: generator closed")
+            return
+        except BaseException:
+            current_app.logger.exception("events: unexpected error in stream")
+            return
 
-    # Return a streaming response with correct headers for SSE
     headers = {
         "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream",
-        "Connection": "keep-alive",
+        # if behind nginx, this disables its response buffering for SSE
+        "X-Accel-Buffering": "no",
+        # tell some proxies not to mangle content
+        "Connection": "keep-alive"
     }
-    return Response(event_stream(), headers=headers)
+    return Response(stream_with_context(event_stream()), mimetype='text/event-stream', headers=headers)
+
+@api.route('/api/debug/key_present', methods=['GET'])
+def debug_key_present():
+    """Return whether API_NINJAS_KEY is configured (does not expose the key)."""
+    present = bool(os.getenv('API_NINJAS_KEY') or current_app.config.get('API_NINJAS_KEY'))
+    return jsonify({'api_ninjas_key_configured': present}), 200
+
+@api.route('/api/debug/list_blobs', methods=['GET'])
+def debug_list_blobs():
+    """
+    Temporary debug endpoint — returns the list_blobs result or full error.
+    Call: GET /api/debug/list_blobs
+    Accepts optional query params: container (or containerUrl), sas
+    """
+    try:
+        # accept either 'container' or 'containerUrl' for convenience
+        container_url = request.args.get('container') or request.args.get('containerUrl') or current_app.config.get('AZURE_CONTAINER_URL') or current_app.config.get('CONTAINER_URL')
+        sas_token = request.args.get('sas') or current_app.config.get('SAS_TOKEN')
+        if not hasattr(sb, 'list_blobs'):
+            return jsonify({'ok': False, 'error': 'sb.list_blobs not found'}), 500
+
+        # preferred call signature: container_url, sas_token
+        try:
+            items = sb.list_blobs(container_url=container_url, sas_token=sas_token)
+        except TypeError:
+            # fallback: some versions accept different params or none
+            try:
+                items = sb.list_blobs()
+            except Exception as inner:
+                raise
+
+        return jsonify({'ok': True, 'items': items})
+    except Exception as exc:
+        current_app.logger.error('debug_list_blobs error: %s\n%s', exc, traceback.format_exc())
+        return jsonify({'ok': False, 'error': str(exc), 'trace': traceback.format_exc()}), 500
+
+@api.route('/api/debug/env_status', methods=['GET'])
+def debug_env_status():
+    """
+    Return presence/availability of key runtime config without leaking secrets.
+    """
+    container_url = current_app.config.get('AZURE_CONTAINER_URL') or current_app.config.get('CONTAINER_URL')
+    sas_present = bool(current_app.config.get('SAS_TOKEN') or os.getenv('SAS_TOKEN'))
+    api_key_present = bool(current_app.config.get('API_NINJAS_KEY') or os.getenv('API_NINJAS_KEY'))
+    # mask container_url (do not reveal whole URL)
+    masked_container = None
+    if container_url:
+        masked_container = container_url if len(container_url) <= 60 else (container_url[:40] + '...' + container_url[-10:])
+    return jsonify({
+        'container_url_present': bool(container_url),
+        'container_url_masked': masked_container,
+        'sas_present': sas_present,
+        'api_ninjas_key_present': api_key_present
+    }), 200

@@ -112,6 +112,21 @@
       <div class="chart-area">
         <canvas id="trendChart" height="140"></canvas>
       </div>
+
+      <!-- add Analyze controls and results -->
+      <div id="analyze-controls" style="margin-top:12px;">
+        <button id="analyze-selected" class="btn">Analyze selected</button>
+        <span id="analyze-status" style="margin-left:10px;"></span>
+      </div>
+
+      <!-- results -->
+      <div id="analyze-result" style="margin-top:12px;">
+        <div><strong>Mango likelihood:</strong> <span id="mango-likelihood">N/A</span></div>
+        <div id="detection-list" style="margin-top:6px;"></div>
+      </div>
+
+      <!-- canvas overlay for boxes (position it over your preview image) -->
+      <canvas id="detection-canvas" style="position:absolute; left:0; top:0; pointer-events:none; display:none;"></canvas>
     </div>
   </div>
 
@@ -143,6 +158,36 @@
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script>
+    // basic runtime state + small helpers to prevent ReferenceErrors
+    let currentItems = [];
+    let currentIndex = 0;
+
+    // safe HTML escape for item names
+    function escapeHtml(str){
+      if(!str) return '';
+      return String(str).replace(/[&<>"'`=\/]/g, function(s){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;",'/':'&#x2F;','`':'&#x60;','=':'&#x3D;'})[s]; });
+    }
+
+    // fallback fetchBlobMetadata used when code asks for blob metadata
+    async function fetchBlobMetadata(name){
+      // server already exposes /api/fetch_blob_content which returns blob bytes,
+      // but some code expects metadata with a blob_url — return the proxy URL here.
+      return { blob_url: name ? ('/api/fetch_blob_content?name=' + encodeURIComponent(name)) : null };
+    }
+
+    // analyzeCurrent was referenced from template — provide a safe stub that triggers the existing analyze button
+    function analyzeCurrent(){
+      try {
+        const btn = document.getElementById('analyzeSelected');
+        if(btn) {
+          // prefer programmatic click if the app wired a handler
+          btn.click();
+          return;
+        }
+      } catch(e){}
+      console.warn('analyzeCurrent: analyzeSelected button missing or no handler attached');
+    }
+
     // apply persisted theme preference on load
     (function(){
       try {
@@ -179,32 +224,47 @@
     let evtSource = null;
     let sseReconnectMs = 1000;
     const sseMaxReconnectMs = 30000;
+    let sseErrorCount = 0;
+    const sseMaxErrors = 3;
+
     function startSSE(){
       if(typeof EventSource === 'undefined') return false;
       if(evtSource) return true;
       try {
         evtSource = new EventSource('/events');
-        evtSource.onopen = ()=> { console.info('SSE open'); sseReconnectMs = 1000; };
+        evtSource.onopen = ()=> { console.info('SSE open'); sseErrorCount = 0; sseReconnectMs = 1000; };
         evtSource.onmessage = (ev)=>{
           try {
             const msg = JSON.parse(ev.data);
             // expected message structure: { type: 'blob', name, etag, lastModified } or { type: 'list', items: [...] }
             if(msg.type === 'blob'){
-              // If a new blob arrived, trigger immediate update
               if(msg.etag && msg.etag !== lastSeenEtag || (!msg.etag && msg.lastModified !== lastSeenLastModified) || msg.name !== lastSeenName){
                 console.info('SSE: new blob event', msg);
-                // ensure list+viewer are updated
                 awaitLoadLatest();
               }
-            } else if(msg.type === 'list' && Array.isArray(msg.items)){
-              // server can push full list -> render and maybe load newest
-              handleServerList(msg.items);
+            } else if(msg.type === 'list'){
+              // server may emit list events without embedding items (avoid heavy payloads)
+              // if items are included, pass them through; otherwise fetch latest list
+              if(Array.isArray(msg.items) && msg.items.length){
+                handleServerList(msg.items);
+              } else {
+                awaitLoadLatest();
+              }
             }
           } catch(e){ console.warn('SSE parse error', e); }
         };
         evtSource.onerror = (e)=>{
           console.warn('SSE error', e);
-          // close and schedule reconnect
+          sseErrorCount++;
+          // if errors keep happening, stop trying SSE and use polling
+          if(sseErrorCount >= sseMaxErrors){
+            console.warn('SSE failing repeatedly, falling back to polling');
+            try { evtSource.close(); } catch(_) {}
+            evtSource = null;
+            startPolling();
+            return;
+          }
+          // transient: close and schedule reconnect
           try { evtSource.close(); } catch(_) {}
           evtSource = null;
           setTimeout(()=> { sseReconnectMs = Math.min(sseMaxReconnectMs, sseReconnectMs * 1.5); startSSE(); }, sseReconnectMs);
@@ -221,224 +281,40 @@
       if(evtSource){ try{ evtSource.close(); }catch(_){} evtSource = null; }
     }
 
-    function handleServerList(items){
-      // items expected: [{ name, etag, lastModified }, ...] newest first
-      if(!items || items.length === 0) return;
-      const newest = items[0];
-      if(newest.etag) {
-        if(newest.etag !== lastSeenEtag) { lastSeenEtag = newest.etag; lastSeenName = newest.name; lastSeenLastModified = newest.lastModified; awaitLoadLatest(); }
-      } else if(newest.lastModified){
-        if(newest.lastModified !== lastSeenLastModified) { lastSeenLastModified = newest.lastModified; lastSeenName = newest.name; awaitLoadLatest(); }
-      } else {
-        // fallback by name
-        if(newest.name !== lastSeenName) { lastSeenName = newest.name; awaitLoadLatest(); }
-      }
+    // Auto-follow newest image state (when true, UI will auto-load newest on list updates)
+    let autoFollowLatest = true;   // start ON as requested
+    let userSelected = false;      // becomes true when user clicks a specific image
+    const idleMs = 20 * 60 * 1000; // 20 minutes
+    let idleTimer = null;
+
+    function updateAutoFollowButton(){
+      const btn = document.getElementById('go');
+      if(!btn) return;
+      btn.textContent = autoFollowLatest ? 'Load latest (follow ON)' : 'Load latest (follow OFF)';
     }
 
-    // helper to call loadLatest but avoid overlapping calls
-    let pendingLoad = false;
-    async function awaitLoadLatest(){
-      if(pendingLoad) return;
-      pendingLoad = true;
-      try { await loadLatest(); } catch(e){ console.warn('awaitLoadLatest err', e); }
-      pendingLoad = false;
+    // call when user interacts to reset idle timer
+    function resetIdleTimer(){
+      if(idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      idleTimer = setTimeout(()=>{
+        // re-enable follow if idle reached
+        userSelected = false;
+        autoFollowLatest = true;
+        updateAutoFollowButton();
+        // fetch and show latest immediately
+        awaitLoadLatest();
+      }, idleMs);
     }
 
-    function toggleAutoRefresh(on) {
-      autoRefresh = typeof on === 'boolean' ? on : !autoRefresh;
-      const btn = document.getElementById('autoRefreshToggle');
-      btn.textContent = `Auto refresh: ${autoRefresh ? 'On' : 'Off'}`;
-      if (autoRefresh) {
-        // try SSE first; if not available, start polling
-        const sseOk = startSSE();
-        if(!sseOk) startPolling();
-      } else {
-        stopPolling();
-        stopSSE();
-      }
-    }
-
-    function startPolling(){
-      stopPolling();
-      // use a self-scheduling loop so we can change next interval based on success/failure
-      const loop = async ()=>{
-        if(!autoRefresh) return;
-        try {
-          const containerUrl = document.getElementById('containerUrl').value.trim() || null;
-          const sas = document.getElementById('sas').value.trim();
-          const items = await listBlobs(accountEl.account, accountEl.container, sas, containerUrl);
-          if(items && items.length){
-            const newest = items[0];
-            // prefer ETag if present
-            const newestEtag = newest.etag || null;
-            const newestLM = newest.lastModified || null;
-            const changed = (newestEtag && newestEtag !== lastSeenEtag) ||
-                            (!newestEtag && newestLM && newestLM !== lastSeenLastModified) ||
-                            (newest.name && newest.name !== lastSeenName && !newestEtag && !newestLM);
-            if(changed){
-              lastSeenEtag = newestEtag; lastSeenLastModified = newestLM; lastSeenName = newest.name;
-              currentItems = items;
-              renderList(items);
-              await loadItem(0);
-            } else {
-              // update list UI (timestamps) without reloading image
-              currentItems = items;
-              renderList(items);
-            }
-          }
-          // success => reduce backoff
-          failureCount = 0;
-          currentPollMs = basePollMs;
-        } catch(e){
-          console.warn('Polling error', e);
-          failureCount++;
-          currentPollMs = Math.min(maxPollMs, Math.max(basePollMs, currentPollMs * backoffFactor));
-        } finally {
-          // schedule next iteration only if autoRefresh still true and SSE not active
-          if(autoRefresh && !evtSource) pollHandle = setTimeout(loop, currentPollMs);
-        }
-      };
-      // start immediately
-      loop();
-    }
-
-    function stopPolling(){
-      if(pollHandle) { clearTimeout(pollHandle); pollHandle = null; }
-    }
-
-    // ---- Application state & helper functions ----
-    let currentItems = [];       // last loaded list from server
-    let currentIndex = null;     // currently displayed index
-
-    // load saved settings from localStorage and populate hidden inputs
-    function loadSavedSettings(){
-      const s = JSON.parse(localStorage.getItem('fruta.settings') || '{}');
-      if(s.containerUrl) document.getElementById('containerUrl').value = s.containerUrl;
-      if(s.sas) document.getElementById('sas').value = s.sas;
-      if(s.account) accountEl.account = s.account;
-      if(s.container) accountEl.container = s.container;
-
-      // settings overlay fields
-      document.getElementById('settingsContainerUrl').value = s.containerUrl || '';
-      document.getElementById('settingsSas').value = s.sas || '';
-      document.getElementById('settingsAccount').value = s.account || accountEl.account;
-      document.getElementById('settingsContainer').value = s.container || accountEl.container;
-    }
-
-    function openSettings(){
-      document.getElementById('settingsOverlay').style.display = 'flex';
-    }
-    function closeSettings(){
-      document.getElementById('settingsOverlay').style.display = 'none';
-    }
-
-    document.getElementById('settingsBtn').addEventListener('click', openSettings);
-    document.getElementById('closeSettings').addEventListener('click', closeSettings);
-    document.getElementById('saveSettings').addEventListener('click', async ()=>{
-      const settings = {
-        containerUrl: document.getElementById('settingsContainerUrl').value.trim() || '',
-        sas: document.getElementById('settingsSas').value.trim() || '',
-        account: document.getElementById('settingsAccount').value.trim() || accountEl.account,
-        container: document.getElementById('settingsContainer').value.trim() || accountEl.container,
-      };
-
-      // Send API key to server for secure storage (if user provided one)
-      const apiKey = document.getElementById('settingsApiKey').value.trim();
-      try {
-        if(apiKey) {
-          // POST apiKey and optional container/account to server; server stores key in app.config (volatile)
-          await fetch('/api/settings', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ apiKey, accountName: settings.account, containerName: settings.container, sas: settings.sas, containerUrl: settings.containerUrl })
-          });
-          // Clear API input after sending for safety (it is not stored in localStorage)
-          document.getElementById('settingsApiKey').value = '';
-        } else {
-          // If no apiKey, still post other non-secret settings (optional)
-          await fetch('/api/settings', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ accountName: settings.account, containerName: settings.container, sas: settings.sas, containerUrl: settings.containerUrl })
-          });
-        }
-      } catch(err){ console.warn('Failed to save server settings', err); }
-
-      // Persist client-only settings locally (do NOT store API key)
-      localStorage.setItem('fruta.settings', JSON.stringify(settings));
-      loadSavedSettings();
-      closeSettings();
+    // attach interaction listeners to reset idle timer
+    ['click','mousemove','keydown','touchstart'].forEach(ev => {
+      document.addEventListener(ev, resetIdleTimer, { passive: true });
     });
 
-    document.getElementById('go').addEventListener('click', ()=> awaitLoadLatest());
-    document.getElementById('analyzeSelected').addEventListener('click', analyzeCurrent);
+    // ensure initial idle timer starts
+    resetIdleTimer();
 
-    // initial load
-    loadSavedSettings();
-
-    // restore previous state (do not start polling unless it was ON)
-    try {
-      const wasOn = JSON.parse(localStorage.getItem('fruta.autoRefresh') || 'false');
-      if(wasOn) toggleAutoRefresh(true);
-      else {
-        // ensure button label matches Off state
-        document.getElementById('autoRefreshToggle').textContent = 'Auto refresh: Off';
-      }
-    } catch(e){ /* ignore malformed storage */ }
-
-    // ---- Networking helpers (talk to our Flask API) ----
-
-    // listBlobs: call backend /api/load_latest and return items array
-    async function listBlobs(accountName, containerName, sas, containerUrl){
-      // prefer explicit containerUrl if supplied (client-side)
-      const params = new URLSearchParams();
-      if(containerUrl) params.set('containerUrl', containerUrl);
-      if(sas) params.set('sas', sas);
-      // backend uses env/app.config if not provided
-      const url = '/api/load_latest' + (params.toString() ? ('?' + params.toString()) : '');
-      const r = await fetch(url, { method: 'GET' });
-      if(!r.ok) {
-        const txt = await r.text().catch(()=>null);
-        throw new Error('load_latest failed: ' + (txt || r.status));
-      }
-      const j = await r.json();
-      return j.items || [];
-    }
-
-    // fetchBlobMetadata: call backend /api/fetch_blob?name=...
-    async function fetchBlobMetadata(name){
-      const params = new URLSearchParams();
-      const containerUrl = document.getElementById('containerUrl').value.trim();
-      const sas = document.getElementById('sas').value.trim();
-      if(containerUrl) params.set('containerUrl', containerUrl);
-      if(sas) params.set('sas', sas);
-      params.set('name', name);
-      const url = '/api/fetch_blob?' + params.toString();
-      const r = await fetch(url);
-      if(!r.ok) throw new Error('fetch_blob failed');
-      return r.json();
-    }
-
-    // loadLatest: fetch list, render, and load newest item if present
-    async function loadLatest(){
-      const containerUrl = document.getElementById('containerUrl').value.trim() || null;
-      const sas = document.getElementById('sas').value.trim();
-      const items = await listBlobs(accountEl.account, accountEl.container, sas, containerUrl);
-      currentItems = items;
-      renderList(items);
-      if(items && items.length) {
-        await loadItem(0);
-      } else {
-        // clear viewer
-        currentIndex = null;
-        document.getElementById('imgwrap').innerHTML = '<div class="muted">No image loaded</div>';
-        document.getElementById('photoInfo').textContent = '';
-        document.getElementById('analyzeSelected').disabled = true;
-        document.getElementById('detectionBadge').style.display = 'none';
-      }
-    }
-
-    // renderList: populate right-hand list; clicking an item loads it
+    // modify renderList to respect autoFollowLatest
     function renderList(items){
       const listEl = document.getElementById('list');
       listEl.innerHTML = '';
@@ -449,19 +325,35 @@
         const name = it.name || '(unknown)';
         const time = it.lastModified ? new Date(it.lastModified).toLocaleString() : '';
         el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><div style="font-weight:600">${escapeHtml(name)}</div><div class="time">${escapeHtml(time)}</div></div>`;
-        el.addEventListener('click', ()=> loadItem(idx));
+        el.addEventListener('click', ()=> {
+          // user explicitly selected an item -> disable follow
+          userSelected = true;
+          autoFollowLatest = false;
+          updateAutoFollowButton();
+          loadItem(idx);
+        });
         listEl.appendChild(el);
       });
+
+      // If follow mode is ON and user hasn't selected a specific image, load newest (index 0)
+      if(autoFollowLatest && !userSelected && items && items.length){
+        // avoid overlapping calls
+        loadItem(0).catch(()=>{ /* ignore */ });
+      }
     }
 
-    // loadItem: display image for item at index (uses item's url if available, otherwise fetch metadata)
+    // update loadItem to disable follow when user manually clicks via other UI paths
     async function loadItem(index){
       if(!currentItems || index < 0 || index >= currentItems.length) return;
       currentIndex = index;
       const it = currentItems[index];
+
+      // If this call was triggered by a user click elsewhere, ensure we set userSelected
+      // (calls from follow behavior will be left as-is)
+      // Note: click handlers above already set userSelected accordingly.
+
       let blobUrl = it.name ? ('/api/fetch_blob_content?name=' + encodeURIComponent(it.name)) : null;
       if(!blobUrl) {
-        // resolve via backend
         try {
           const meta = await fetchBlobMetadata(it.name);
           blobUrl = meta.blob_url || meta.blobUrl || null;
@@ -477,10 +369,12 @@
         document.getElementById('analyzeSelected').disabled = true;
         return;
       }
-      // create image element (use fetch to ensure CORS & SAS work)
       const img = document.createElement('img');
       img.alt = it.name || '';
-      img.onload = ()=> { /* loaded */ };
+      img.onload = ()=> {
+        // run analysis automatically after image loads
+        try { analyzeBlob(it).catch(()=>{}); } catch(_) {}
+      };
       img.onerror = ()=> { wrap.innerHTML = '<div class="muted">Failed to load image</div>'; };
       img.src = blobUrl;
       wrap.innerHTML = '';
@@ -489,89 +383,137 @@
       // update info and controls
       document.getElementById('photoInfo').textContent = `${it.name || ''} ${it.lastModified ? ' · ' + new Date(it.lastModified).toLocaleString() : ''}`;
       document.getElementById('analyzeSelected').disabled = false;
-      // hide badge until analysis runs
       document.getElementById('detectionBadge').style.display = 'none';
     }
 
-    // analyzeCurrent: call /api/analyze for current item and display results
-    async function analyzeCurrent(){
-      if(currentIndex === null || !currentItems[currentIndex]) return;
-      const it = currentItems[currentIndex];
-      // prefer blob url if present
-      const payload = {};
-      if(it.name) payload.blobUrl = '/api/fetch_blob_content?name=' + encodeURIComponent(it.name);
-      else payload.blobName = it.name;
-
-      // include client-side containerUrl/sas if configured so server can resolve correctly
-      const containerUrl = document.getElementById('containerUrl').value.trim();
-      const sas = document.getElementById('sas').value.trim();
-      if(containerUrl) payload.containerUrl = containerUrl;
-      if(sas) payload.sas = sas;
-
-      // disable button while analyzing
-      const btn = document.getElementById('analyzeSelected');
-      btn.disabled = true;
-      btn.textContent = 'Analyzing…';
-      try {
-        const r = await fetch('/api/analyze', {
+    // POST to server analyze endpoint and update badge based on response
+    async function analyzeBlob(it){
+      if(!it) return;
+      try{
+        const payload = it.name ? { blobName: it.name } : { blobUrl: it.url || it.blob_url };
+        const resp = await fetch('/api/analyze', {
           method: 'POST',
-          headers: {'Content-Type':'application/json'},
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        const j = await r.json();
-        if(!r.ok){
-          console.warn('analyze error', j);
-          alert('Analyze failed: ' + (j.error || r.status));
-        } else {
-          // show mango likelihood and detections
-          const likelihood = j.mango_likelihood || 0;
-          const badge = document.getElementById('detectionBadge');
-          if(likelihood > 0.3){
-            badge.style.display = 'inline-block';
-            badge.textContent = `MANGO ${(likelihood*100).toFixed(0)}%`;
-          } else {
-            badge.style.display = 'none';
-          }
-          // optional: show detections in console or small popup
-          console.info('Detections', j.detections || []);
-          // update chart data (simple increment)
-          pushTrendData(likelihood);
+        if(!resp.ok){
+          console.warn('analyze API returned', resp.status);
+          return;
         }
-      } catch(e){
-        console.warn('analyze request failed', e);
-        alert('Analyze request failed');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Analyze (vision)';
+        const data = await resp.json();
+        // show mango badge when likelihood > 0 (adjust threshold as desired)
+        const badge = document.getElementById('detectionBadge');
+        const prob = Number(data.mango_likelihood || 0);
+        if(prob > 0){
+          badge.style.display = 'inline-block';
+          badge.textContent = `MANGO ${Math.round(prob * 100)}%`;
+        } else {
+          badge.style.display = 'none';
+        }
+
+        // Update analyze result display
+        document.getElementById('mango-likelihood').textContent = prob > 0 ? `${Math.round(prob * 100)}%` : 'N/A';
+        const detectionList = document.getElementById('detection-list');
+        detectionList.innerHTML = '';
+        if(Array.isArray(data.detections) && data.detections.length > 0){
+          data.detections.forEach(det => {
+            const item = document.createElement('div');
+            item.textContent = `${det.label} (${Math.round(det.confidence * 100)}%)`;
+            detectionList.appendChild(item);
+          });
+        } else {
+          detectionList.innerHTML = '<div class="muted">No detections found</div>';
+        }
+      }catch(e){
+        console.warn('analyzeBlob error', e);
       }
     }
 
-    // small utility: escape HTML to avoid injection in list
-    function escapeHtml(s){
-      return String(s||'').replace(/[&<>"']/g, (m)=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]) );
-    }
-
-    // ---- simple trend chart to show mango likelihood over time ----
-    const ctx = document.getElementById('trendChart').getContext('2d');
-    const trendData = { labels: [], datasets: [{ label: 'Mango likelihood', data: [], borderColor: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#0ea5a4', tension:0.3 }] };
-    const trendChart = new Chart(ctx, { type: 'line', data: trendData, options: { responsive:true, maintainAspectRatio:false, scales:{ y:{ min:0, max:1 } } } });
-    function pushTrendData(value){
-      const label = new Date().toLocaleTimeString();
-      trendData.labels.push(label);
-      trendData.datasets[0].data.push(Number(value || 0));
-      if(trendData.labels.length > 20){ trendData.labels.shift(); trendData.datasets[0].data.shift(); }
-      trendChart.update();
-    }
-
-    // Expose a simple keyboard shortcut: L = load latest, A = analyze
-    document.addEventListener('keydown', (e)=>{
-      if(e.key === 'L' || e.key === 'l') awaitLoadLatest();
-      if((e.key === 'A' || e.key === 'a') && !document.getElementById('analyzeSelected').disabled) analyzeCurrent();
+    // "Load latest" button should enable follow mode and immediately show newest
+    document.getElementById('go').addEventListener('click', async ()=>{
+      userSelected = false;
+      autoFollowLatest = true;
+      updateAutoFollowButton();
+      awaitLoadLatest(); // loads list and renderList will open newest
     });
 
-    // initial action: attempt to load latest on first open
+    // ensure button label matches initial state
+    updateAutoFollowButton();
+
+    // existing SSE / polling handlers already call awaitLoadLatest() or handleServerList()
+    // ensure handleServerList uses renderList which now follows the follow flag:
+    function handleServerList(items){
+      if(!items || items.length === 0) return;
+      const newest = items[0];
+      if(newest.etag) {
+        if(newest.etag !== lastSeenEtag) { lastSeenEtag = newest.etag; lastSeenName = newest.name; lastSeenLastModified = newest.lastModified; awaitLoadLatest(); }
+      } else if(newest.lastModified){
+        if(newest.lastModified !== lastSeenLastModified) { lastSeenLastModified = newest.lastModified; lastSeenName = newest.name; awaitLoadLatest(); }
+      } else {
+        if(newest.name !== lastSeenName) { lastSeenName = newest.name; awaitLoadLatest(); }
+      }
+    }
+
+    // Fetch latest list from server and render (used by SSE/polling and UI)
+    async function awaitLoadLatest(){
+      try{
+        const resp = await fetch('/api/load_latest');
+        if(!resp.ok){
+          console.warn('load_latest failed', resp.status);
+          return;
+        }
+        const data = await resp.json();
+        currentItems = Array.isArray(data.items) ? data.items : [];
+        // server returns newest-first; ensure we respect that
+        renderList(currentItems);
+      }catch(e){
+        console.warn('awaitLoadLatest error', e);
+      }
+    }
+
+    // Simple polling fallback
+    function startPolling(){
+      stopPolling();
+      // immediate fetch then interval
+      awaitLoadLatest().catch(()=>{});
+      pollHandle = setInterval(()=> { awaitLoadLatest().catch(()=>{}); }, currentPollMs);
+    }
+    function stopPolling(){
+      if(pollHandle){ clearInterval(pollHandle); pollHandle = null; }
+    }
+
+    // Toggle auto-refresh (SSE preferred, polling fallback)
+    function updateAutoRefreshToggleButton(){
+      const b = document.getElementById('autoRefreshToggle');
+      if(!b) return;
+      b.textContent = autoRefresh ? 'Auto refresh: On' : 'Auto refresh: Off';
+    }
+
+    function toggleAutoRefresh(forceState){
+      autoRefresh = (typeof forceState === 'boolean') ? forceState : !autoRefresh;
+      updateAutoRefreshToggleButton();
+      if(autoRefresh){
+        // try SSE first, if not available start polling
+        if(!startSSE()){
+          startPolling();
+        } else {
+          // ensure we have current data
+          awaitLoadLatest().catch(()=>{});
+        }
+      } else {
+        stopSSE();
+        stopPolling();
+      }
+    }
+
+    // bind the UI toggle button
+    const autoBtn = document.getElementById('autoRefreshToggle');
+    if(autoBtn) autoBtn.addEventListener('click', ()=> toggleAutoRefresh());
+    // ensure label initially correct
+    updateAutoRefreshToggleButton();
+
+    // initial action: attempt to load latest on first open and start refresh
     awaitLoadLatest();
-    // start auto-refresh (SSE preferred) so UI updates when new blobs arrive
     toggleAutoRefresh(true);
   </script>
 </body>

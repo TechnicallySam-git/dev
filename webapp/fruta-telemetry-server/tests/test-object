@@ -1,0 +1,115 @@
+# language: python
+import json
+import requests
+import os
+import pytest
+from app import app
+from api.routes import analyze  # absolute import of function under test as requested
+
+class FakeResponse:
+    def __init__(self, status_code=200, content=b'', headers=None, text=None, json_data=None):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {}
+        self._text = text if text is not None else (json.dumps(json_data) if json_data is not None else '')
+        self._json = json_data
+
+    @property
+    def text(self):
+        return self._text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._json
+
+@pytest.fixture
+def client():
+    app.config['TESTING'] = True
+    # Do not rely on environment; tests will set API key via app.config as needed
+    with app.test_client() as client:
+        yield client
+
+def test_analyze_with_blob_url_calls_api_ninjas(monkeypatch, client):
+    # Arrange
+    app.config['API_NINJAS_KEY'] = 'test-key-123'
+    image_bytes = b'\xff\xd8\xff'  # pretend JPEG
+    # Patch requests.get to return image bytes
+    def fake_get(url, timeout=20):
+        assert url == 'http://example.com/img.jpg'
+        return FakeResponse(status_code=200, content=image_bytes, headers={'Content-Type': 'image/jpeg'}, text='ok')
+    called = {}
+    # Patch requests.post to simulate API Ninjas response
+    def fake_post(url, headers=None, files=None, timeout=None):
+        called['url'] = url
+        called['headers'] = headers
+        called['files'] = files
+        # return one detection (mango) with confidence 0.8
+        return FakeResponse(status_code=200, json_data=[{"name": "Mango", "confidence": 0.8}])
+    monkeypatch.setattr(requests, 'get', fake_get)
+    monkeypatch.setattr(requests, 'post', fake_post)
+
+    # Act
+    resp = client.post('/api/analyze', json={'blobUrl': 'http://example.com/img.jpg'})
+
+    # Assert
+    assert resp.status_code == 200
+    j = resp.get_json()
+    assert 'detections' in j
+    assert isinstance(j['detections'], list)
+    assert len(j['detections']) == 1
+    assert j['mango_likelihood'] == pytest.approx(0.8)
+    # ensure API Ninjas was called with provided key
+    assert called.get('url') == 'https://api.api-ninjas.com/v1/objectdetection'
+    assert called.get('headers', {}).get('X-Api-Key') == 'test-key-123'
+    # files should contain 'image'
+    assert 'image' in called.get('files', {})
+
+def test_analyze_with_blob_name_resolves_and_calls_api_ninjas(monkeypatch, client):
+    # Arrange
+    app.config['API_NINJAS_KEY'] = 'another-key'
+    # Patch sb.fetch_blob_data used in api.routes (api.routes imported services.blob as sb)
+    def fake_fetch_blob_data(container_url=None, blob_name=None, sas_token=None):
+        return {'blob_url': 'http://example.com/img2.jpg'}
+    monkeypatch.setattr('api.routes.sb.fetch_blob_data', fake_fetch_blob_data)
+
+    image_bytes = b'\x89PNG'  # pretend PNG
+    def fake_get(url, timeout=20):
+        assert url == 'http://example.com/img2.jpg'
+        return FakeResponse(status_code=200, content=image_bytes, headers={'Content-Type': 'image/png'}, text='ok')
+    called = {}
+    def fake_post(url, headers=None, files=None, timeout=None):
+        called['url'] = url
+        called['headers'] = headers
+        called['files'] = files
+        return FakeResponse(status_code=200, json_data=[{"name": "Fruit", "confidence": 0.55}])
+    monkeypatch.setattr(requests, 'get', fake_get)
+    monkeypatch.setattr(requests, 'post', fake_post)
+
+    # Act
+    resp = client.post('/api/analyze', json={'blobName': 'img2.jpg'})
+
+    # Assert
+    assert resp.status_code == 200
+    j = resp.get_json()
+    assert 'detections' in j
+    assert j['mango_likelihood'] == pytest.approx(0.55)
+    assert called.get('headers', {}).get('X-Api-Key') == 'another-key'
+
+def test_analyze_no_api_key_returns_500(client, monkeypatch):
+    # Ensure no API key present
+    app.config.pop('API_NINJAS_KEY', None)
+    os.environ.pop('API_NINJAS_KEY', None)
+
+    # Provide a blobUrl and patch requests.get so fetch step doesn't fail before api key check
+    def fake_get(url, timeout=20):
+        return FakeResponse(status_code=200, content=b'\xff', headers={'Content-Type': 'image/jpeg'}, text='ok')
+    monkeypatch.setattr(requests, 'get', fake_get)
+
+    resp = client.post('/api/analyze', json={'blobUrl': 'http://example.com/any.jpg'})
+    assert resp.status_code == 500
+    j = resp.get_json()
+    assert 'error' in j
+    assert 'API_NINJAS_KEY' in j['error'] or 'API_NINJAS_KEY' in str(j.get('error', ''))
