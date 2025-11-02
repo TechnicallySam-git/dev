@@ -12,6 +12,59 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentItems = [];
     let selectedIndex = -1;
     let lastDrawnDetections = [];
+    // Chart.js instance for detection confidences
+    let detectionsChart = null;
+    // Helper: render detections as a horizontal bar chart using Chart.js
+    function renderDetectionsChart(detections) {
+        try {
+            const canvas = document.getElementById('trendChart');
+            if (!canvas) return;
+            // ensure detections is an array
+            const items = Array.isArray(detections) ? detections : [];
+            const labels = items.map(d => d.name || d.label || '(unknown)');
+            const data = items.map(d => Math.round((Number(d.confidence || 0) || 0) * 100));
+            const bg = items.map(d => {
+                const n = (d.name || d.label || '').toString().toLowerCase();
+                return (n.includes('mango') || n.includes('fruit')) ? '#ff8c00' : '#6c6f73';
+            });
+
+            // destroy previous chart if exists
+            if (detectionsChart) {
+                try { detectionsChart.destroy(); } catch (e) { /* ignore */ }
+                detectionsChart = null;
+            }
+
+            // create Chart.js chart (horizontal bar)
+            detectionsChart = new Chart(canvas, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Confidence %',
+                        data: data,
+                        backgroundColor: bg,
+                        borderRadius: 6,
+                        barThickness: 18
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { callbacks: { label: ctx => `${ctx.parsed.x}%` } }
+                    },
+                    scales: {
+                        x: { beginAtZero: true, max: 100, ticks: { callback: v => v + '%' } },
+                        y: { ticks: { autoSkip: false } }
+                    }
+                }
+            });
+        } catch (e) {
+            console.warn('renderDetectionsChart failed', e);
+        }
+    }
 
     // Wait until preview image has a layout size (use before drawing overlays)
     function waitForPreviewImage(timeout = 1500) {
@@ -38,6 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Analyze helper that avoids duplicates and logs a stack trace for diagnostics
     async function analyzeForItem(item, src) {
+        ensurePreviewAndDetails();
         const key = item?.name || src || ('blob:' + Date.now());
         if (!key) return;
         if (inFlightAnalyses.has(key)) {
@@ -105,6 +159,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
             // replace existing detection list/graph
+            // ensure containers exist and get the details container once
+            ensurePreviewAndDetails();
             let details = document.getElementById('detection-details');
             if (!details) {
                 details = document.createElement('div');
@@ -121,15 +177,17 @@ document.addEventListener('DOMContentLoaded', () => {
             // save for redraw on resize and draw now
             lastDrawnDetections = detections;
             renderDetectionsGraph(details, detections, matches);
+            // also render the Chart.js chart (separate visual)
+            renderDetectionsChart(detections);
 
             lastAnalyzedKey = key;
-        } catch (err) {
-            detectionBadge.textContent = 'Analysis error';
-            console.error('analyze error', err);
-        } finally {
-            inFlightAnalyses.delete(key);
-        }
-    }
+         } catch (err) {
+             detectionBadge.textContent = 'Analysis error';
+             console.error('analyze error', err);
+         } finally {
+             inFlightAnalyses.delete(key);
+         }
+     }
 
     loadLatestButton.addEventListener('click', loadLatest);
     autoRefreshToggle.addEventListener('click', toggleAutoRefresh);
@@ -240,12 +298,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Helper: draw a simple horizontal bar graph under 'details'
     function renderDetectionsGraph(container, detections, mangoMatches) {
+        ensurePreviewAndDetails();
+        // diagnostics
+        console.debug('renderDetectionsGraph called', { containerId: container && container.id, detectionsLength: (detections||[]).length, mangoMatchesLength: (mangoMatches||[]).length });
+
         // remove previous graph if present
         const prev = container.querySelector('.detection-graph-wrap');
         if (prev) prev.remove();
 
         const wrap = document.createElement('div');
         wrap.className = 'detection-graph-wrap';
+        // make sure wrapper is visible and can grow
+        wrap.style.display = 'block';
+        wrap.style.width = '100%';
         const title = document.createElement('div');
         title.className = 'detection-graph-title';
         title.textContent = 'Detections — confidence';
@@ -257,16 +322,20 @@ document.addEventListener('DOMContentLoaded', () => {
             empty.textContent = 'No detections to display';
             wrap.appendChild(empty);
             container.appendChild(wrap);
-            // clear overlay
-            const ov = document.getElementById('detection-overlay');
+
+            // clear overlay if any
+            const ov = document.getElementById('detection-overlay') || document.getElementById('detection-canvas');
             if (ov && ov.getContext) {
-                const ctx = ov.getContext('2d');
-                ctx.clearRect(0,0,ov.width,ov.height);
+                try {
+                    const ctx = ov.getContext('2d');
+                    ctx && ctx.clearRect(0,0,ov.width || 0, ov.height || 0);
+                    ov.style.display = 'none';
+                } catch(e){}
             }
             return;
         }
 
-        // Build a simple DOM list with bar fills (works on all browsers and scales)
+        // Build DOM bars (robust, independent from canvas)
         const list = document.createElement('div');
         list.className = 'detection-bars';
         const fruitNames = new Set((mangoMatches || []).map(m => ((m.name || '').toString().toLowerCase())));
@@ -325,6 +394,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         wrap.appendChild(list);
+
         // legend
         const legend = document.createElement('div');
         legend.className = 'detection-graph-legend';
@@ -332,24 +402,24 @@ document.addEventListener('DOMContentLoaded', () => {
         legend.innerHTML = '<span style="display:inline-flex;align-items:center;margin-right:12px"><span style="width:12px;height:12px;background:#ff8c00;display:inline-block;margin-right:6px"></span>Fruit</span><span style="display:inline-flex;align-items:center"><span style="width:12px;height:12px;background:#6c6f73;display:inline-block;margin-right:6px"></span>Other</span>';
         wrap.appendChild(legend);
 
+        // ensure container is visible (some layouts may hide it)
+        try { container.style.display = 'block'; } catch(e){}
+
         container.appendChild(wrap);
 
-        // Ensure overlay boxes are drawn after preview image has loaded / has size.
+        // Draw bounding boxes on overlay after ensuring preview image layout
         const img = document.getElementById('preview-img');
-        if (!img) {
-            // no preview image available — nothing to draw
-            return;
-        }
+        if (!img) return;
 
         const drawWhenReady = () => {
             try {
-                // only draw if image has layout size
                 const w = img.clientWidth || img.offsetWidth;
                 const h = img.clientHeight || img.offsetHeight;
-                if (w === 0 || h === 0) {
-                    // skip — wait for load
-                    return false;
-                }
+                console.debug('drawWhenReady sizes', {w,h});
+                if (w === 0 || h === 0) return false;
+                // make sure overlay canvas is visible and sized
+                const ov = (document.getElementById('detection-overlay') || document.getElementById('detection-canvas'));
+                if (ov) ov.style.display = 'block';
                 drawOverlayBoxes(detections);
                 return true;
             } catch (e) {
@@ -358,16 +428,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         };
 
-        // If image already sized, draw immediately
         if (drawWhenReady()) return;
-
-        // Otherwise attach one-time load listener and small timeout fallback
-        img.addEventListener('load', function onLoad() {
-            drawWhenReady();
-        }, { once: true });
-
-        // fallback: attempt drawing after short delay (covers cached-change cases)
-        setTimeout(() => { drawWhenReady(); }, 300);
+        img.addEventListener('load', function onLoad() { drawWhenReady(); }, { once: true });
+        setTimeout(() => { drawWhenReady(); }, 500);
     }
 
     function drawOverlayBoxes(detections) {
@@ -451,198 +514,39 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }, 120);
     });
+
+    // new: fetch and render recent messages
+    async function fetchMessages() {
+      try {
+        const res = await fetch('/api/messages?limit=50');
+        if (!res.ok) return;
+        const messages = await res.json();
+        const list = document.getElementById('telemetry-list');
+        if (!list) return;
+        list.innerHTML = '';
+        messages.forEach(m => {
+          const div = document.createElement('div');
+          div.className = 'telemetry-item';
+          div.style.borderBottom = '1px solid #eee';
+          div.style.padding = '8px 0';
+          div.innerHTML = `<div><strong>${escapeHtml(m.deviceId || '')}</strong> <small style="color:var(--muted)">${m.received_at}</small></div>
+                           <div style="font-size:12px;color:var(--muted)">${escapeHtml(m.imageFileName || '')}</div>
+                           <pre style="margin:6px 0 0 0;font-size:12px">${escapeHtml(JSON.stringify(m.payload, null, 2))}</pre>`;
+          list.appendChild(div);
+        });
+      } catch (e) {
+        console.warn('fetchMessages failed', e);
+      }
+    }
+
+    // start polling messages
+    setInterval(fetchMessages, 5000);
+    document.addEventListener('DOMContentLoaded', fetchMessages);
 });
 
-(function(){
-  const viewer = document.getElementById('viewer');
-  const listEl = document.getElementById('list');
-  let currentItems = [];
+// NOTE: removed duplicate bottom IIFE blocks — UI logic consolidated above.
 
-  function renderList(items){
-    listEl.innerHTML = '';
-    items.forEach((it, idx) => {
-      const img = document.createElement('img');
-      img.src = it.url || it.blob_url || '';
-      img.alt = it.name || '';
-      img.dataset.idx = idx;
-      img.addEventListener('click', () => loadItem(idx));
-      listEl.appendChild(img);
-    });
-  }
-
-  function loadItem(idx){
-    const it = currentItems[idx];
-    if (!it) return;
-    viewer.src = it.url || it.blob_url || '';
-  }
-
-  function loadLatest(){
-    fetch('/api/load_latest')
-      .then(r => r.json())
-      .then(data => {
-        currentItems = Array.isArray(data.items) ? data.items : [];
-        renderList(currentItems);
-        if (currentItems.length) loadItem(0);
-      })
-      .catch(e => console.error('load_latest failed', e));
-  }
-
-  function setupEventSource(){
-    try {
-      const es = new EventSource('/events');
-      es.onmessage = (ev) => {
-        // server sends a JSON payload in data
-        try {
-          const d = JSON.parse(ev.data || '{}');
-          if (d && d.type === 'list' && d.refresh) {
-            console.info('SSE: refresh event, fetching latest list');
-            loadLatest();
-          }
-        } catch (err) {
-          // ignore malformed
-        }
-      };
-      es.onerror = (e) => {
-        console.warn('EventSource error', e);
-      };
-      // initial load
-      loadLatest();
-    } catch (e) {
-      console.error('EventSource not supported', e);
-      // fallback polling
-      loadLatest();
-      setInterval(loadLatest, 5000);
-    }
-  }
-
-  // start
-  document.addEventListener('DOMContentLoaded', setupEventSource);
-})();
-
-(function(){
-  const analyzeBtn = document.getElementById('analyze-selected');
-  const statusEl = document.getElementById('analyze-status');
-  const mangoEl = document.getElementById('mango-likelihood');
-  const listEl = document.getElementById('detection-list');
-  const canvas = document.getElementById('detection-canvas');
-
-  // Helper: find the currently selected image URL on your page.
-  // Adapt selector to your markup (e.g. a selected list item or preview img src).
-  function getSelectedBlobUrl(){
-    // Example: preview img with id="preview-img"
-    const img = document.getElementById('preview-img');
-    return img ? img.src : null;
-  }
-
-  async function analyzeBlobUrl(blobUrl, sasToken){
-    statusEl.textContent = 'analyzing...';
-    mangoEl.textContent = '...';
-    listEl.innerHTML = '';
-    try{
-      const payload = { blobUrl: blobUrl };
-      if(sasToken) payload.sas = sasToken; // optional
-      const r = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const data = await r.json();
-      if(r.ok){
-        renderDetections(data, blobUrl);
-        mangoEl.textContent = (data.mango_likelihood || 0).toString();
-      }else{
-        listEl.textContent = data.error || JSON.stringify(data);
-        mangoEl.textContent = 'error';
-      }
-    }catch(err){
-      listEl.textContent = 'request failed: ' + err;
-      mangoEl.textContent = 'error';
-    }finally{
-      statusEl.textContent = '';
-    }
-  }
-
-  function renderDetections(data, blobUrl){
-    // show detection list
-    listEl.innerHTML = '';
-    (data.detections || []).forEach(d => {
-      const li = document.createElement('div');
-      const conf = Number(d.confidence ?? d.score ?? 0);
-      const confPct = Math.round((isNaN(conf) ? 0 : conf) * 100);
-      li.textContent = `${d.name || d.label || ''} — ${confPct}%`;
-      listEl.appendChild(li);
-    });
- 
-    // draw boxes on the preview image if available
-    const img = document.getElementById('preview-img');
-    if(!img) return;
-    // ensure we have a canvas to draw on (use existing or create one)
-    let cvs = canvas || document.getElementById('detection-overlay') || null;
-    if (!cvs) {
-      cvs = document.createElement('canvas');
-      cvs.id = 'detection-canvas';
-      cvs.style.position = 'absolute';
-      cvs.style.left = '0';
-      cvs.style.top = '0';
-      cvs.style.pointerEvents = 'none';
-      cvs.style.zIndex = '30';
-      img.parentNode.appendChild(cvs);
-    }
-
-    const displayW = img.clientWidth || img.offsetWidth;
-    const displayH = img.clientHeight || img.offsetHeight;
-    if (displayW === 0 || displayH === 0) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    cvs.style.display = 'block';
-    cvs.style.width = displayW + 'px';
-    cvs.style.height = displayH + 'px';
-    cvs.width = Math.round(displayW * dpr);
-    cvs.height = Math.round(displayH * dpr);
-    cvs.style.left = img.offsetLeft + 'px';
-    cvs.style.top = img.offsetTop + 'px';
-
-    const ctx = cvs.getContext('2d');
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, displayW, displayH);
-    ctx.strokeStyle = 'lime';
-    ctx.lineWidth = 2;
-    ctx.font = '14px sans-serif';
-
-    // scale coordinates from natural image to displayed image
-    const sx = img.naturalWidth ? (displayW / img.naturalWidth) : 1;
-    const sy = img.naturalHeight ? (displayH / img.naturalHeight) : 1;
-    (data.detections || []).forEach(d => {
-      const bb = d.bounding_box || {};
-      const x1 = parseFloat(bb.x1) || 0;
-      const y1 = parseFloat(bb.y1) || 0;
-      const x2 = parseFloat(bb.x2) || 0;
-      const y2 = parseFloat(bb.y2) || 0;
-      const x = x1 * sx;
-      const y = y1 * sy;
-      const w = Math.max(0, (x2 - x1) * sx);
-      const h = Math.max(0, (y2 - y1) * sy);
-      ctx.strokeRect(x, y, w, h);
-      const conf = Number(d.confidence ?? d.score ?? 0);
-      const label = `${d.name || d.label || ''} ${(isNaN(conf) ? 0 : (conf*100)).toFixed(0)}%`;
-      ctx.fillStyle = 'rgba(0,0,0,0.6)';
-      const textW = ctx.measureText(label).width + 6;
-      ctx.fillRect(x, Math.max(0, y - 18), textW, 18);
-      ctx.fillStyle = 'white';
-      ctx.fillText(label, x + 3, Math.max(12, y - 4));
-    });
-  }
-
-  analyzeBtn && analyzeBtn.addEventListener('click', ()=>{
-    const url = getSelectedBlobUrl();
-    if(!url){
-      statusEl.textContent = 'no image selected';
-      return;
-    }
-    analyzeBlobUrl(url);
-  });
-
-  // expose for debugging
-  window.analyzeBlobUrl = analyzeBlobUrl;
-})();
+<div class="card" id="telemetry-panel" style="margin-top:12px;">
+  <h3 style="margin:0 0 8px 0;">Recent telemetry</h3>
+  <div id="telemetry-list" style="max-height:320px;overflow:auto;"></div>
+</div>

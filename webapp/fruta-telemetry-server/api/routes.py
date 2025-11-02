@@ -10,7 +10,13 @@ import re
 from flask import current_app
 import traceback
 
+# new telemetry store imports
+from services.telemetry_store import init_db, insert_message, get_messages
+
 api = Blueprint('api', __name__)
+
+# initialize DB (idempotent)
+init_db()
 
 @api.route('/api/load_latest', methods=['GET'])
 def load_latest():
@@ -363,3 +369,25 @@ def debug_env_status():
         'sas_present': sas_present,
         'api_ninjas_key_present': api_key_present
     }), 200
+
+# add ingestion endpoint (insert near other API endpoints)
+@api.route('/api/telemetry', methods=['POST'])
+def telemetry_ingest():
+    try:
+        obj = request.get_json(force=True)
+    except Exception:
+        return ("bad json", 400)
+    if not obj:
+        return ("empty", 400)
+    try:
+        insert_message(obj)
+    except Exception as e:
+        current_app.logger.exception("telemetry_ingest: failed insert")
+        return (str(e), 500)
+    return ('', 204)
+
+@api.route('/api/messages', methods=['GET'])
+def messages_list():
+    limit = int(request.args.get('limit', 100))
+    msgs = get_messages(limit=limit)
+    return jsonify(msgs)
