@@ -1,94 +1,63 @@
-# FRUTA Telemetry Viewer
+# FRUTA Telemetry Server
 
-Overview
---------
-FRUTA Telemetry Viewer is a small Flask web app that lists images from Azure Blob Storage and allows analyzing them with an object‑detection API. The app entrypoint is [`app.py`](app.py). Server API routes are in [`api/routes.py`](api/routes.py). Blob helpers live in [`services/blob.py`](services/blob.py).
+This directory contains the Flask-based Telemetry Viewer UI and server API used to:
+- List and fetch images from Azure Blob Storage.
+- Analyze images via an object-detection API (API Ninjas by default).
+- Ingest and persist device telemetry for UI display.
 
-Quick start
------------
-1. Create & activate a virtualenv (Windows example):
+Quick start (local)
+1. Create a virtualenv and install deps:
    ```powershell
    python -m venv venv
    venv\Scripts\activate
    pip install -r requirements.txt
    ```
+2. Create `.env` (copy from `.env.example`) and set:
+   - API_NINJAS_KEY — required for object detection.
+   - Either AZURE_STORAGE_CONNECTION_STRING + AZURE_STORAGE_CONTAINER_NAME (SDK mode)
+     OR ACCOUNT_NAME + CONTAINER_NAME + SAS_TOKEN / CONTAINER_URL (SAS/http listing mode).
+   - PORT — optional, default 5000.
+3. Start server:
+   ```powershell
+   python app.py
+   ```
+4. Open the UI: http://localhost:5000
 
-2. Copy and edit `.env.example` -> `.env`. Recommended values (the app reads multiple env names for convenience):
+Environment variables (summary)
+- API_NINJAS_KEY — API Ninjas key for /api/analyze.
+- AZURE_STORAGE_CONNECTION_STRING — preferred for SDK mode.
+- AZURE_STORAGE_CONTAINER_NAME — used with connection string.
+- ACCOUNT_NAME, CONTAINER_NAME, SAS_TOKEN — alternative SAS-based listing.
+- CONTAINER_URL — full container URL (with SAS) can be used by the frontend settings.
 
-   - For simple REST/SAS access:
-     - ACCOUNT_NAME (e.g. frutablob)
-     - CONTAINER_NAME (e.g. frutacontainer)
-     - SAS_TOKEN (optional) — client and server code accept SAS tokens
+Useful endpoints
+- GET /api/load_latest — returns { items: [...] } (newest-first).
+- GET /api/fetch_blob?name=... — returns metadata and a blob_url for direct fetch.
+- POST /api/analyze — send { "blobName": "..." } or { "blobUrl": "..." } to run object detection.
+- POST /api/telemetry — ingest telemetry JSON from devices or scripts. Returns 204 on success.
+- GET /api/messages?limit=50 — returns recent telemetry messages for the UI.
+- GET /events — Server-Sent Events (SSE) for list refresh notifications.
+- Debug: GET /api/debug/list_blobs, GET /api/debug/env_status, GET /api/debug/key_present
 
-   - For SDK / connection string usage (used by `BlobService` in `services/blob.py`):
-     - AZURE_STORAGE_CONNECTION_STRING
-     - AZURE_STORAGE_CONTAINER_NAME
+Telemetry ingestion
+- The server persists a compact record of incoming telemetry; see `services/telemetry_store.py` for schema.
+- Device scripts (e.g. fetch_decode_latest_blob.py) provide helpers that can POST to /api/telemetry.
 
-   - App / runtime:
-     - PORT (optional, default 5000)
-     - API_NINJAS_KEY (required for /api/analyze to call the object detection API)
+Debugging tips
+- If images are missing in the UI, call /api/debug/list_blobs to verify the backend listing.
+- For analyze failures, check server logs for API Ninjas responses and /api/debug/key_present to ensure the key is configured.
+- SSE clients may be proxied — ensure response buffering is disabled (X-Accel-Buffering: no) as provided.
 
-   See [.env.example](.env.example) for an example format.
-
-Configuration details
----------------------
-- The Flask app (`app.py`) loads env vars into `app.config`:
-  - `ACCOUNT_NAME` / `AZURE_STORAGE_ACCOUNT`
-  - `CONTAINER_NAME` / `AZURE_STORAGE_CONTAINER`
-  - `SAS_TOKEN` / `AZURE_STORAGE_SAS_TOKEN`
-  - `API_NINJAS_KEY`
-
-- Blob listing / metadata:
-  - `services/blob.py` supports two modes:
-    - HTTP List API using account/container + SAS or caller-provided container URL (it parses the XML list).
-    - SDK mode via `BlobService` using `AZURE_STORAGE_CONNECTION_STRING` and `AZURE_STORAGE_CONTAINER_NAME`.
-
-- API endpoints of interest (implemented in [`api/routes.py`](api/routes.py)):
-  - GET `/api/load_latest` — returns JSON { items: [...] }
-  - GET `/api/fetch_blob?name=...` — returns blob metadata (blob_url)
-  - POST `/api/analyze` — accepts `{ "blobName": "..."} or {"blobUrl": "..."}` and returns detection results
-  - GET `/events` — SSE endpoint that pushes list/blob events
-
-Running the app
----------------
-Run locally:
-```powershell
-python app.py
-```
-Open http://localhost:5000 (port can be overridden with PORT env var).
-
-Testing
--------
-Run the included tests with pytest:
-```powershell
-pip install pytest
-pytest -q
-```
-Tests live at [`tests/test_app.py`](tests/test_app.py). Note: some tests assume network or dummy responses; adjust environment variables or mocks when running in CI/local.
-
-Frontend
---------
-- Main template: [`templates/index.html`](templates/index.html)
-- Client logic: [`static/js/main.js`](static/js/main.js)
-- Styles: [`static/css/styles.css`](static/css/styles.css)
-
-Notes and troubleshooting
--------------------------
-- If you prefer the Azure Cosmos/SDK style configuration, set `AZURE_STORAGE_CONNECTION_STRING` and `AZURE_STORAGE_CONTAINER_NAME` — `BlobService` will use the SDK methods.
-- The frontend saves a few settings to localStorage and can POST server settings (the UI expects `/api/settings` to exist in some deployments — not present by default). Review [`api/routes.py`](api/routes.py) and the frontend code if you need to persist server-side API keys or add a settings endpoint.
-- For local development of blob listing, either point the app to a real storage account or provide a container listing URL (with SAS) in the UI Settings panel.
+Contributing
+- Create a branch, update code, and add tests where applicable. Keep secrets out of commits — use .env.
 
 Files of interest
------------------
-- [`app.py`](app.py)
-- [`api/routes.py`](api/routes.py)
-- [`services/blob.py`](services/blob.py)
-- [`templates/index.html`](templates/index.html)
-- [`static/js/main.js`](static/js/main.js)
-- [`tests/test_app.py`](tests/test_app.py)
-- [`requirements.txt`](requirements.txt)
-- [`.env.example` ](.env.example)
+- templates/index.html — frontend markup and client logic.
+- static/js/main.js — primary browser JS (list, image preview, analyze).
+- api/routes.py — server API endpoints.
+- services/blob.py — blob listing/fetch helpers.
+- services/telemetry_store.py — lightweight telemetry DB code.
+- arduino.ino — example ESP32 device firmware (capture/upload/telemetry).
 
 License
--------
-MIT
+- MIT
